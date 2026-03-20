@@ -1687,7 +1687,7 @@ public class ReplicatorTest extends ReplicatorTestBase {
                 Mockito.any());
 
         // Mock the readEntriesFailed scenario:
-        // Use AtomicBoolean to control whether to trigger read failure, manually set true/false by test code.
+        // Use AtomicBoolean to control whether to trigger read failure
         // Initialized to true to ensure the first readMoreEntries after replicator startup is intercepted.
         AtomicBoolean isMakeReadFail = new AtomicBoolean(true);
         doAnswer(invocation -> {
@@ -1719,7 +1719,6 @@ public class ReplicatorTest extends ReplicatorTestBase {
 
         // --- Test readEntriesFailed scenario ---
         // isMakeReadFail is already true, replicator's readMoreEntries keeps failing
-
         // Record current mark delete position
         Position posBeforeReadFail = cursor.getMarkDeletedPosition();
 
