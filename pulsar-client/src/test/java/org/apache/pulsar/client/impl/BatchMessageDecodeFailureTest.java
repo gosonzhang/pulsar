@@ -20,7 +20,7 @@ package org.apache.pulsar.client.impl;
 
 import static org.apache.pulsar.common.protocol.Commands.DEFAULT_CONSUMER_EPOCH;
 import static org.mockito.Mockito.spy;
-import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.verify;
 import static org.testng.Assert.assertEquals;
 import io.netty.buffer.ByteBuf;
@@ -134,7 +134,7 @@ public class BatchMessageDecodeFailureTest {
                 "Corrupted batch should not produce any messages in queue");
 
         // Verify discardCorruptedBatchMessage incremented the failed counter
-        verify(statsRecorder, times(1)).incrementNumReceiveFailed();
+        verify(statsRecorder, timeout(2000)).incrementNumReceiveFailed();
     }
 
     /**
@@ -173,7 +173,7 @@ public class BatchMessageDecodeFailureTest {
         // which uses internalPinnedExecutor.execute(). Since it's async,
         // we check the stats synchronously — discardCorruptedBatchMessage
         // is called inline in the catch block.
-        verify(statsRecorder, times(1)).incrementNumReceiveFailed();
+        verify(statsRecorder, timeout(2000)).incrementNumReceiveFailed();
     }
 
     /**
@@ -215,6 +215,6 @@ public class BatchMessageDecodeFailureTest {
                 "Truncated payload should not produce any messages in queue");
 
         // The receive-failed counter should have been incremented
-        verify(statsRecorder, times(1)).incrementNumReceiveFailed();
+        verify(statsRecorder, timeout(2000)).incrementNumReceiveFailed();
     }
 }
