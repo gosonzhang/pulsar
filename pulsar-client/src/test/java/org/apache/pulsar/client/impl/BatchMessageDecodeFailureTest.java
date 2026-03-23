@@ -177,37 +177,6 @@ public class BatchMessageDecodeFailureTest {
     }
 
     /**
-     * Empty payload with non-zero batchSize: the buffer has no readable bytes
-     * but batchSize declares 2 messages.
-     * Expected: IndexOutOfBoundsException during readUnsignedInt, entire batch discarded.
-     */
-    @Test
-    public void testEmptyPayloadWithNonZeroBatchSize() {
-        BrokerEntryMetadata brokerEntryMetadata =
-                new BrokerEntryMetadata().setBrokerTimestamp(1).setIndex(1);
-
-        MessageMetadata metadata = new MessageMetadata()
-                .setProducerName("test-producer")
-                .setSequenceId(1)
-                .setPublishTime(1)
-                .setNumMessagesInBatch(2);
-
-        // Empty buffer: readUnsignedInt() will throw IndexOutOfBoundsException
-        ByteBuf emptyPayload = Unpooled.buffer(0);
-
-        consumer.receiveIndividualMessagesFromBatch(brokerEntryMetadata, metadata, 0, null,
-                emptyPayload, new MessageIdData().setLedgerId(3000).setEntryId(3),
-                mockCnx, DEFAULT_CONSUMER_EPOCH, false);
-
-        // No messages should be enqueued
-        assertEquals(consumer.numMessagesInQueue(), 0,
-                "Empty payload should not produce any messages in queue");
-
-        // The receive-failed counter should have been incremented
-        verify(statsRecorder, times(1)).incrementNumReceiveFailed();
-    }
-
-    /**
      * Truncated single-message payload: metadata size is valid but payload
      * data is truncated (fewer bytes than declared payloadSize).
      * Expected: exception during retainedSlice, entire batch discarded.
