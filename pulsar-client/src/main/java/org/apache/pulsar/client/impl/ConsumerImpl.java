@@ -1786,6 +1786,7 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
 
         SingleMessageMetadata singleMessageMetadata = new SingleMessageMetadata();
         int skippedMessages = 0;
+        int processedMessages = 0;
         try {
             for (int i = 0; i < batchSize; ++i) {
                 final MessageImpl<T> message = newSingleMessage(i, batchSize, brokerEntryMetadata, msgMetadata,
@@ -1815,13 +1816,14 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
                     continue;
                 }
                 executeNotifyCallback(message);
+                processedMessages++;
             }
             if (ackBitSet != null) {
                 ackBitSet.recycle();
             }
-        } catch (IllegalStateException e) {
-            log.warn("[{}] [{}] unable to obtain message in batch", subscription, consumerName, e);
-            discardCorruptedMessage(messageId, cnx, ValidationError.BatchDeSerializeError);
+        } catch (IllegalStateException | IllegalArgumentException e) {
+            discardCorruptedBatchMessage(messageId, cnx,
+                    (batchSize - skippedMessages - processedMessages), ValidationError.BatchDeSerializeError);
         }
 
         if (deadLetterPolicy != null && possibleSendToDeadLetterTopicMessages != null) {
@@ -2151,6 +2153,14 @@ public class ConsumerImpl<T> extends ConsumerBase<T> implements ConnectionHandle
         log.error("[{}][{}] Discarding corrupted message at {}:{}", topic, subscription, messageId.getLedgerId(),
                 messageId.getEntryId());
         discardMessage(messageId, currentCnx, validationError, 1);
+    }
+
+    private void discardCorruptedBatchMessage(MessageIdData messageId, ClientCnx currentCnx,
+                                              int unreadMessages, ValidationError validationError) {
+        log.error("[{}] [{}] Discarding corrupted batch message at {}:{}, unread count={}, exception={}",
+                subscription, consumerName, messageId.getLedgerId(), messageId.getEntryId(),
+                unreadMessages, validationError);
+        discardMessage(messageId, currentCnx, validationError, unreadMessages);
     }
 
     private void discardMessage(MessageIdData messageId, ClientCnx currentCnx, ValidationError validationError,
