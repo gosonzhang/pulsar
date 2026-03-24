@@ -667,7 +667,7 @@ public class ReplicatorTest extends ReplicatorTestBase {
         // Disconnect replicator to stop geo-replication, so new messages will form backlog
         pauseReplicator(replicator);
 
-        // Produce more messages while replication is paused ¡ª these will accumulate as backlog
+        // Produce more messages while replication is paused ï¿½ï¿½ these will accumulate as backlog
         producer1.produce(2);
 
         // wait for backlog to accumulate
@@ -689,7 +689,6 @@ public class ReplicatorTest extends ReplicatorTestBase {
 
         final TopicName dest = TopicName
                 .get(BrokerTestUtil.newUniqueName("persistent://pulsar/ns/clearBacklogTopic"));
-
         @Cleanup
         MessageProducer producer1 = new MessageProducer(url1, dest);
 
@@ -712,7 +711,7 @@ public class ReplicatorTest extends ReplicatorTestBase {
         // Disconnect replicator to stop geo-replication, so new messages will form backlog
         pauseReplicator(replicator);
 
-        // Produce more messages while replication is paused ¡ª these will accumulate as backlog
+        // Produce more messages while replication is paused ï¿½ï¿½ these will accumulate as backlog
         producer1.produce(2);
 
         // wait for backlog to accumulate
