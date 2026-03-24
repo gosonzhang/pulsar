@@ -665,7 +665,7 @@ public class ReplicatorTest extends ReplicatorTestBase {
         // Disconnect replicator to stop geo-replication, so new messages will form backlog
         pauseReplicator(replicator);
 
-        // Produce more messages while replication is paused �� these will accumulate as backlog
+        // Produce more messages while replication is paused, these will accumulate as backlog
         producer1.produce(2);
 
         // wait for backlog to accumulate
@@ -709,7 +709,7 @@ public class ReplicatorTest extends ReplicatorTestBase {
         // Disconnect replicator to stop geo-replication, so new messages will form backlog
         pauseReplicator(replicator);
 
-        // Produce more messages while replication is paused �� these will accumulate as backlog
+        // Produce more messages while replication is paused, these will accumulate as backlog
         producer1.produce(2);
 
         // wait for backlog to accumulate
