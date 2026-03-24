@@ -992,9 +992,4 @@ public abstract class PersistentReplicator extends AbstractReplicator
     String getReplicatorId() {
         return  replicatorId;
     }
-
-    @VisibleForTesting
-    public void incrementWaitForCursorRewindingRefCnf() {
-        waitForCursorRewindingRefCnf++;
-    }
 }

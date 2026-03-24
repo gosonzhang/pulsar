@@ -642,12 +642,8 @@ public class ReplicatorTest extends ReplicatorTestBase {
     @Test(timeOut = 30000)
     public void testReplicatorClearBacklog() throws Exception {
 
-        // This test is to verify that reset cursor fails on global topic
-        SortedSet<String> testDests = new TreeSet<>();
-
         final TopicName dest = TopicName
                 .get(BrokerTestUtil.newUniqueName("persistent://pulsar/ns/clearBacklogTopic"));
-        testDests.add(dest.toString());
 
         @Cleanup
         MessageProducer producer1 = new MessageProducer(url1, dest);
@@ -655,12 +651,31 @@ public class ReplicatorTest extends ReplicatorTestBase {
         @Cleanup
         MessageConsumer consumer1 = new MessageConsumer(url3, dest);
 
-        // Produce from cluster1 and consume from the rest
+        // Produce from cluster1 to trigger topic and replicator creation
         producer1.produce(2);
+
         PersistentTopic topic = (PersistentTopic) pulsar1.getBrokerService().getTopicReference(dest.toString()).get();
-        PersistentReplicator replicator = (PersistentReplicator) spy(
-                topic.getReplicators().get(topic.getReplicators().keySet().stream().toList().get(0)));
-        replicator.incrementWaitForCursorRewindingRefCnf();
+        PersistentReplicator replicator = (PersistentReplicator) topic.getReplicators()
+                .get(topic.getReplicators().keySet().stream().toList().get(0));
+
+        // Wait until the first batch of messages is fully replicated (backlog = 0),
+        // so that disconnect() won't be rejected due to non-zero backlog
+        Awaitility.await().untilAsserted(() -> {
+            assertEquals(replicator.getNumberOfEntriesInBacklog(), 0);
+        });
+
+        // Disconnect replicator to stop geo-replication, so new messages will form backlog
+        pauseReplicator(replicator);
+
+        // Produce more messages while replication is paused ¡ª these will accumulate as backlog
+        producer1.produce(2);
+
+        // wait for backlog to accumulate
+        Awaitility.await().untilAsserted(() -> {
+            assertEquals(replicator.getNumberOfEntriesInBacklog(), 2);
+        });
+
+        // Clear the backlog
         replicator.clearBacklog().get();
         Thread.sleep(100);
         replicator.updateRates(); // for code-coverage
@@ -672,12 +687,8 @@ public class ReplicatorTest extends ReplicatorTestBase {
     @Test(timeOut = 30000)
     public void testReplicatorExpireMsgAsync() throws Exception {
 
-        // This test is to verify that reset cursor fails on global topic
-        SortedSet<String> testDests = new TreeSet<>();
-
         final TopicName dest = TopicName
                 .get(BrokerTestUtil.newUniqueName("persistent://pulsar/ns/clearBacklogTopic"));
-        testDests.add(dest.toString());
 
         @Cleanup
         MessageProducer producer1 = new MessageProducer(url1, dest);
@@ -685,12 +696,31 @@ public class ReplicatorTest extends ReplicatorTestBase {
         @Cleanup
         MessageConsumer consumer1 = new MessageConsumer(url3, dest);
 
-        // Produce from cluster1 and consume from the rest
+        // Produce from cluster1 to trigger topic and replicator creation
         producer1.produce(2);
+
         PersistentTopic topic = (PersistentTopic) pulsar1.getBrokerService().getTopicReference(dest.toString()).get();
-        PersistentReplicator replicator = (PersistentReplicator) spy(
-                topic.getReplicators().get(topic.getReplicators().keySet().stream().toList().get(0)));
-        replicator.incrementWaitForCursorRewindingRefCnf();
+        PersistentReplicator replicator = (PersistentReplicator) topic.getReplicators()
+                .get(topic.getReplicators().keySet().stream().toList().get(0));
+
+        // Wait until the first batch of messages is fully replicated (backlog = 0),
+        // so that disconnect() won't be rejected due to non-zero backlog
+        Awaitility.await().untilAsserted(() -> {
+            assertEquals(replicator.getNumberOfEntriesInBacklog(), 0);
+        });
+
+        // Disconnect replicator to stop geo-replication, so new messages will form backlog
+        pauseReplicator(replicator);
+
+        // Produce more messages while replication is paused ¡ª these will accumulate as backlog
+        producer1.produce(2);
+
+        // wait for backlog to accumulate
+        Awaitility.await().untilAsserted(() -> {
+            assertEquals(replicator.getNumberOfEntriesInBacklog(), 2);
+        });
+
+        // Clear the backlog
         replicator.clearBacklog().get();
         Thread.sleep(100);
         replicator.updateRates(); // for code-coverage
