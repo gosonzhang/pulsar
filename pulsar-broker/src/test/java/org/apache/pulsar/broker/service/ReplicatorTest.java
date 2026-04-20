@@ -662,7 +662,7 @@ public class ReplicatorTest extends ReplicatorTestBase {
         PersistentTopic topic = (PersistentTopic) pulsar1.getBrokerService().getTopicReference(dest.toString()).get();
         PersistentReplicator replicator = (PersistentReplicator) spy(
                 topic.getReplicators().get(topic.getReplicators().keySet().stream().toList().get(0)));
-        replicator.readEntriesFailed(new ManagedLedgerException.InvalidCursorPositionException("failed"), null);
+        replicator.incrementWaitForCursorRewindingRefCnf();
         replicator.clearBacklog().get();
         Thread.sleep(100);
         replicator.updateRates(); // for code-coverage
@@ -692,7 +692,7 @@ public class ReplicatorTest extends ReplicatorTestBase {
         PersistentTopic topic = (PersistentTopic) pulsar1.getBrokerService().getTopicReference(dest.toString()).get();
         PersistentReplicator replicator = (PersistentReplicator) spy(
                 topic.getReplicators().get(topic.getReplicators().keySet().stream().toList().get(0)));
-        replicator.readEntriesFailed(new ManagedLedgerException.InvalidCursorPositionException("failed"), null);
+        replicator.incrementWaitForCursorRewindingRefCnf();
         replicator.clearBacklog().get();
         Thread.sleep(100);
         replicator.updateRates(); // for code-coverage
@@ -1663,7 +1663,7 @@ public class ReplicatorTest extends ReplicatorTestBase {
     @Test
     public void testReplicatorWithFailedAck() throws Exception {
 
-        log.info("--- Starting ReplicatorTest::testReplication ---");
+        log.info("--- Starting ReplicatorTest::testReplicatorWithFailedAck ---");
 
         String namespace = BrokerTestUtil.newUniqueName("pulsar/ns");
         admin1.namespaces().createNamespace(namespace, Sets.newHashSet("r1"));
@@ -1696,14 +1696,28 @@ public class ReplicatorTest extends ReplicatorTestBase {
         }).when(spyCursor).asyncDelete(Mockito.any(Position.class), Mockito.any(AsyncCallbacks.DeleteCallback.class),
                 Mockito.any());
 
+        // Mock the readEntriesFailed scenario:
+        // Use AtomicBoolean to control whether to trigger read failure
+        // Initialized to true to ensure the first readMoreEntries after replicator startup is intercepted.
+        AtomicBoolean isMakeReadFail = new AtomicBoolean(true);
+        doAnswer(invocation -> {
+            if (isMakeReadFail.get()) {
+                AsyncCallbacks.ReadEntriesCallback callback = invocation.getArgument(2);
+                Object ctx = invocation.getArgument(3);
+                log.info("asyncReadEntriesOrWait will be failed");
+                callback.readEntriesFailed(new ManagedLedgerException("Mocked read failure"), ctx);
+                return null;
+            } else {
+                log.info("asyncReadEntriesOrWait will proceed normally");
+                return invocation.callRealMethod();
+            }
+        }).when(spyCursor).asyncReadEntriesOrWait(Mockito.anyInt(), Mockito.anyLong(),
+                Mockito.any(AsyncCallbacks.ReadEntriesCallback.class), Mockito.any(), Mockito.any(Position.class));
+
         log.info("--- Starting producer --- " + url1);
         admin1.namespaces().setNamespaceReplicationClusters(namespace, Sets.newHashSet("r1", "r2"), false);
-        // Produce from cluster1 and consume from the rest
-        producer1.produce(2);
 
-        MessageIdImpl lastMessageId = (MessageIdImpl) topic.getLastMessageId().get();
-        Position lastPosition = PositionFactory.create(lastMessageId.getLedgerId(), lastMessageId.getEntryId());
-
+        // Wait for replicator to start
         Awaitility.await().pollInterval(1, TimeUnit.SECONDS).timeout(30, TimeUnit.SECONDS)
                 .ignoreExceptions()
                 .untilAsserted(() -> {
@@ -1713,9 +1727,33 @@ public class ReplicatorTest extends ReplicatorTestBase {
                             replicator.getState());
                 });
 
-        // Make sure all the data has replicated to the remote cluster before close the cursor.
-        Awaitility.await().untilAsserted(() -> assertEquals(cursor.getMarkDeletedPosition(), lastPosition));
+        // --- Test readEntriesFailed scenario ---
+        // isMakeReadFail is already true, replicator's readMoreEntries keeps failing
+        // Record current mark delete position
+        Position posBeforeReadFail = cursor.getMarkDeletedPosition();
 
+        // Produce messages; since reads keep failing, messages cannot be replicated
+        producer1.produce(2);
+
+        MessageIdImpl lastMessageId = (MessageIdImpl) topic.getLastMessageId().get();
+        Position lastPosition = PositionFactory.create(lastMessageId.getLedgerId(), lastMessageId.getEntryId());
+
+        // During 2 seconds of continuous read failure, mark delete position should not advance
+        Awaitility.await()
+                .during(2, TimeUnit.SECONDS)
+                .atMost(5, TimeUnit.SECONDS)
+                .untilAsserted(() -> assertEquals(cursor.getMarkDeletedPosition(), posBeforeReadFail));
+
+        // Disable the read failure flag; replicator will read normally on retry, thus resuming replication
+        isMakeReadFail.set(false);
+
+        // Wait for replicator to recover from read failure and complete replication
+        // (mark delete catches up to the latest position)
+        Awaitility.await().timeout(30, TimeUnit.SECONDS).untilAsserted(() -> {
+            assertEquals(cursor.getMarkDeletedPosition(), lastPosition);
+        });
+
+        // --- Test DeleteCallback scenario ---
         isMakeAckFail.set(true);
 
         producer1.produce(10);
