@@ -508,6 +508,9 @@ public abstract class PersistentReplicator extends AbstractReplicator
             return;
         }
 
+        InFlightTask inFlightTask = (InFlightTask) ctx;
+        inFlightTask.setEntries(Collections.emptyList());
+
         // Reduce read batch size to avoid flooding bookies with retries
         readBatchSize = topic.getBrokerService().pulsar().getConfiguration().getDispatcherMinReadBatchSize();
 
