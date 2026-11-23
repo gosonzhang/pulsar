@@ -86,14 +86,35 @@ public interface ProducerBuilder<T> {
      * this duration, the send future completes exceptionally. A value of {@link Duration#ZERO}
      * disables the timeout.
      *
+     * <p>The timeout starts once the message has been admitted against the client memory limit:
+     * the time a send spends blocked on that limit (see {@link #blockIfQueueFull(boolean)}) does
+     * not count against it.
+     *
+     * <p>The timeout does not guarantee that retries continue for the entire duration. On a
+     * scalable topic, exhausting the bounded segment-gone retry budget can fail a send earlier.
+     * Disabling the timeout does not disable that retry budget.
+     *
      * @param timeout the send timeout duration
      * @return this builder instance for chaining
      */
     ProducerBuilder<T> sendTimeout(Duration timeout);
 
     /**
-     * Whether the producer should block when the pending message queue is full,
-     * rather than failing immediately. Default is {@code true}.
+     * What a send does when the client memory limit is reached. The memory limit, set with
+     * {@link PulsarClientBuilder#memoryLimit(MemorySize)}, is the only bound on the messages a
+     * producer holds while they wait to be sent and acknowledged.
+     *
+     * <p>When {@code true} (the default), {@link MessageBuilder#send()} and
+     * {@link org.apache.pulsar.client.api.v5.async.AsyncMessageBuilder#send()} block the calling
+     * thread until enough pending messages have been acknowledged to make room. When {@code false},
+     * they fail right away with {@link PulsarClientException.MemoryBufferIsFullException} and leave
+     * it to the application to retry.
+     *
+     * <p>A send issued from one of the client's IO threads never blocks, whatever this setting: at
+     * the limit it fails with {@link PulsarClientException.MemoryBufferIsFullException}, since
+     * waiting there would hold up the acknowledgements that free the memory. Code chained on the
+     * future of an acknowledged send runs on the IO thread that received the acknowledgement, so a
+     * send issued from such a continuation is one of these.
      *
      * @param blockIfQueueFull {@code true} to block, {@code false} to fail immediately
      * @return this builder instance for chaining

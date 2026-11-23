@@ -20,6 +20,7 @@ package org.apache.pulsar.broker.stats.prometheus;
 
 import static org.apache.pulsar.broker.stats.prometheus.PrometheusMetricsGeneratorUtils.generateSystemMetrics;
 import static org.apache.pulsar.broker.stats.prometheus.PrometheusMetricsGeneratorUtils.getTypeStr;
+import com.google.common.annotations.VisibleForTesting;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.CompositeByteBuf;
@@ -47,6 +48,7 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
+import java.util.function.BooleanSupplier;
 import java.util.zip.CRC32;
 import java.util.zip.Deflater;
 import lombok.CustomLog;
@@ -297,10 +299,10 @@ public class PrometheusMetricsGenerator implements AutoCloseable {
     }
 
     private final PulsarService pulsar;
-    private final boolean includeTopicMetrics;
-    private final boolean includeConsumerMetrics;
-    private final boolean includeProducerMetrics;
-    private final boolean splitTopicAndPartitionIndexLabel;
+    private final BooleanSupplier includeTopicMetrics;
+    private final BooleanSupplier includeConsumerMetrics;
+    private final BooleanSupplier includeProducerMetrics;
+    private final BooleanSupplier splitTopicAndPartitionIndexLabel;
     private final Clock clock;
 
     private volatile int initialBufferSize = DEFAULT_INITIAL_BUFFER_SIZE;
@@ -308,6 +310,20 @@ public class PrometheusMetricsGenerator implements AutoCloseable {
     public PrometheusMetricsGenerator(PulsarService pulsar, boolean includeTopicMetrics,
                                       boolean includeConsumerMetrics, boolean includeProducerMetrics,
                                       boolean splitTopicAndPartitionIndexLabel, Clock clock) {
+        this(pulsar, () -> includeTopicMetrics, () -> includeConsumerMetrics, () -> includeProducerMetrics,
+                () -> splitTopicAndPartitionIndexLabel, clock);
+    }
+
+    public PrometheusMetricsGenerator(PulsarService pulsar, Clock clock) {
+        this(pulsar, pulsar.getConfiguration()::isExposeTopicLevelMetricsInPrometheus,
+                pulsar.getConfiguration()::isExposeConsumerLevelMetricsInPrometheus,
+                pulsar.getConfiguration()::isExposeProducerLevelMetricsInPrometheus,
+                pulsar.getConfiguration()::isSplitTopicAndPartitionLabelInPrometheus, clock);
+    }
+
+    private PrometheusMetricsGenerator(PulsarService pulsar, BooleanSupplier includeTopicMetrics,
+                                       BooleanSupplier includeConsumerMetrics, BooleanSupplier includeProducerMetrics,
+                                       BooleanSupplier splitTopicAndPartitionIndexLabel, Clock clock) {
         this.pulsar = pulsar;
         this.includeTopicMetrics = includeTopicMetrics;
         this.includeConsumerMetrics = includeConsumerMetrics;
@@ -326,15 +342,17 @@ public class PrometheusMetricsGenerator implements AutoCloseable {
 
             generateSystemMetrics(stream, pulsar.getConfiguration().getClusterName());
 
-            NamespaceStatsAggregator.generate(pulsar, includeTopicMetrics, includeConsumerMetrics,
-                    includeProducerMetrics, splitTopicAndPartitionIndexLabel, metricStreams);
+            boolean exportTopicMetrics = includeTopicMetrics.getAsBoolean();
+            NamespaceStatsAggregator.generate(pulsar, exportTopicMetrics, includeConsumerMetrics.getAsBoolean(),
+                    includeProducerMetrics.getAsBoolean(), splitTopicAndPartitionIndexLabel.getAsBoolean(),
+                    metricStreams);
 
             if (pulsar.getWorkerServiceOpt().isPresent()) {
                 pulsar.getWorkerService().generateFunctionsStats(stream);
             }
 
             if (pulsar.getConfiguration().isTransactionCoordinatorEnabled()) {
-                TransactionAggregator.generate(pulsar, metricStreams, includeTopicMetrics);
+                TransactionAggregator.generate(pulsar, metricStreams, exportTopicMetrics);
             }
 
             metricStreams.flushAllToStream(stream);
@@ -407,14 +425,12 @@ public class PrometheusMetricsGenerator implements AutoCloseable {
 
         if (pulsar.getConfiguration().isExposeManagedLedgerMetricsInPrometheus()) {
             // generate managedLedger metrics
-            parseMetricsToPrometheusMetrics(new ManagedLedgerMetrics(pulsar).generate(),
-                    clusterName, Collector.Type.GAUGE, stream);
+            new ManagedLedgerMetrics(pulsar).generate(stream);
         }
 
         if (pulsar.getConfiguration().isExposeManagedCursorMetricsInPrometheus()) {
             // generate managedCursor metrics
-            parseMetricsToPrometheusMetrics(new ManagedCursorMetrics(pulsar).generate(),
-                    clusterName, Collector.Type.GAUGE, stream);
+            new ManagedCursorMetrics(pulsar).generate(stream);
         }
 
         parseMetricsToPrometheusMetrics(pulsar.getBrokerService()
@@ -426,7 +442,8 @@ public class PrometheusMetricsGenerator implements AutoCloseable {
                 clusterName, Collector.Type.GAUGE, stream);
     }
 
-    private static void parseMetricsToPrometheusMetrics(Collection<Metrics> metrics, String cluster,
+    @VisibleForTesting
+    static void parseMetricsToPrometheusMetrics(Collection<Metrics> metrics, String cluster,
                                                         Collector.Type metricType, SimpleTextOutputStream stream) {
         Set<String> names = new HashSet<>();
         for (Metrics metrics1 : metrics) {

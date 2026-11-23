@@ -18,7 +18,7 @@
 #
 
 name: Setup Gradle
-description: Sets up Gradle with Develocity or public build scan publishing by default
+description: Sets up Gradle with runner memory defaults and build scans for public repositories
 inputs:
   develocity-access-key:
     description: 'Develocity access key for authenticated build scans'
@@ -28,6 +28,10 @@ inputs:
     description: 'Whether to publish build scans or use Develocity when the access key is set'
     required: false
     default: 'true'
+  memory-profile:
+    description: 'Gradle memory profile: auto (low-memory on Linux runners with up to 8 GiB RAM), low-memory, or standard'
+    required: false
+    default: 'auto'
   cache-read-only:
     description: 'Whether the Gradle cache is read-only'
     required: false
@@ -40,7 +44,7 @@ runs:
   using: composite
   steps:
     - name: Set Develocity Project ID and configure custom settings
-      if: ${{ inputs.develocity-access-key != '' && inputs.build-scan-publish == 'true' }}
+      if: ${{ inputs.develocity-access-key != '' && inputs.build-scan-publish == 'true' && github.event.repository.visibility == 'public' }}
       shell: bash
       run: |
         mkdir -p ~/.gradle
@@ -48,24 +52,45 @@ runs:
         grep -q 'systemProp.develocity.projectId=' ~/.gradle/gradle.properties || echo systemProp.develocity.projectId=pulsar >> ~/.gradle/gradle.properties
         grep -q 'systemProp.scan.uploadInBackground=' ~/.gradle/gradle.properties || echo systemProp.scan.uploadInBackground=false >> ~/.gradle/gradle.properties
 
+    - name: Add the JDK version to the Gradle User Home cache key
+      shell: bash
+      run: |
+        # Gradle caches compile task outputs per JDK, but setup-gradle keys the Gradle User Home by
+        # OS and job only, so a job can restore a home saved by another JDK's build and miss every
+        # compile task. GRADLE_BUILD_ACTION_CACHE_KEY_ENVIRONMENT, read but not documented by
+        # setup-gradle since at least v5, replaces the OS part of the key and of every restore key.
+        # Should a release stop reading it, the keys go back to the OS part.
+        jdk_major=$(sed -n 's/^JAVA_VERSION="\([0-9]*\).*/\1/p' "$JAVA_HOME/release")
+        echo "GRADLE_BUILD_ACTION_CACHE_KEY_ENVIRONMENT=${RUNNER_OS}-${RUNNER_ARCH}-jdk${jdk_major}" >> "$GITHUB_ENV"
+
     - name: Setup Gradle with Develocity
-      if: ${{ inputs.develocity-access-key != '' && inputs.build-scan-publish == 'true' }}
-      uses: gradle/actions/setup-gradle@39e147cb9de83bb9910b8ef8bd7fff0ee20fcd6f
+      if: ${{ inputs.develocity-access-key != '' && inputs.build-scan-publish == 'true' && github.event.repository.visibility == 'public' }}
+      uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
       with:
         develocity-injection-enabled: true
         develocity-url: https://develocity.apache.org
         # expected format is develocity.apache.org:<access-key>
         develocity-access-key: ${{ inputs.develocity-access-key }}
-        build-scan-publish: ${{ inputs.build-scan-publish }}
+        develocity-plugin-version: '4.5.1'
+        develocity-ccud-plugin-version: '2.8.0'
+        build-scan-publish: ${{ inputs.build-scan-publish == 'true' && github.event.repository.visibility == 'public' }}
         cache-read-only: ${{ inputs.cache-read-only }}
         add-job-summary: ${{ inputs.add-job-summary }}
 
     - name: Setup Gradle
-      if: ${{ !(inputs.develocity-access-key != '' && inputs.build-scan-publish == 'true') }}
-      uses: gradle/actions/setup-gradle@39e147cb9de83bb9910b8ef8bd7fff0ee20fcd6f
+      if: ${{ !(inputs.develocity-access-key != '' && inputs.build-scan-publish == 'true' && github.event.repository.visibility == 'public') }}
+      uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
       with:
-        build-scan-publish: ${{ inputs.build-scan-publish }}
+        build-scan-publish: ${{ inputs.build-scan-publish == 'true' && github.event.repository.visibility == 'public' }}
         build-scan-terms-of-use-url: 'https://gradle.com/terms-of-service'
         build-scan-terms-of-use-agree: 'yes'
+        develocity-plugin-version: '4.5.1'
+        develocity-ccud-plugin-version: '2.8.0'
         cache-read-only: ${{ inputs.cache-read-only }}
         add-job-summary: ${{ inputs.add-job-summary }}
+
+    - name: Configure Gradle memory
+      shell: bash
+      env:
+        MEMORY_PROFILE: ${{ inputs.memory-profile }}
+      run: bash "$GITHUB_ACTION_PATH/configure-memory.sh" "$MEMORY_PROFILE"

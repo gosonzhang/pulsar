@@ -38,14 +38,14 @@ tasks.named<ProcessResources>("processTestResources") {
 dependencies {
     implementation(libs.slog)
     api(project(":pulsar-functions:pulsar-functions-runtime"))
-    implementation(project(":pulsar-broker-common"))
+    api(project(":pulsar-broker-common"))
     implementation(project(":pulsar-opentelemetry"))
     implementation(project(":pulsar-client-original"))
     implementation(project(":pulsar-client-admin-original"))
-    implementation(project(":pulsar-functions:pulsar-functions-proto"))
+    api(project(":pulsar-functions:pulsar-functions-proto"))
     implementation(project(":pulsar-functions:pulsar-functions-secrets"))
     implementation(project(":pulsar-docs-tools")) {
-        exclude(group = "io.swagger")
+        exclude(group = "io.swagger.core.v3")
     }
     implementation(project(":pulsar-package-management:pulsar-package-core"))
 
@@ -54,12 +54,12 @@ dependencies {
     implementation(libs.guava)
     implementation(libs.gson)
     implementation(libs.picocli)
-    implementation(libs.jackson.core)
-    implementation(libs.jackson.databind)
+    api(libs.jackson.core)
+    api(libs.jackson.databind)
     implementation(libs.netty.common)
     implementation(libs.byte.buddy)
 
-    implementation(libs.distributedlog.core) {
+    api(libs.distributedlog.core) {
         exclude(group = "net.jpountz.lz4", module = "lz4")
     }
     implementation(libs.bookkeeper.server)
@@ -69,66 +69,47 @@ dependencies {
     implementation(libs.jersey.container.servlet)
     implementation(libs.jersey.container.servlet.core)
     implementation(libs.jersey.media.json.jackson)
-    implementation(libs.jersey.media.multipart)
+    api(libs.jersey.media.multipart)
 
     implementation(libs.jetty.server)
     implementation(libs.jetty.alpn.conscrypt.server)
-    implementation(libs.jetty.ee8.servlet)
-    implementation(libs.jetty.ee8.servlets)
+    implementation(libs.jetty.ee10.servlet)
+    implementation(libs.jetty.ee10.servlets)
 
     implementation(libs.jakarta.activation.api)
-    implementation(libs.jakarta.ws.rs.api)
+    api(libs.jakarta.ws.rs.api)
 
     implementation(libs.simpleclient)
-    implementation(libs.simpleclient.hotspot)
+    implementation(libs.prometheus.metrics.instrumentation.jvm)
     implementation(libs.simpleclient.common)
+    implementation(libs.prometheus.metrics.model)
+    implementation(libs.prometheus.metrics.exposition.textformats)
 
-    compileOnly(libs.swagger.core) {
-        exclude(group = "com.fasterxml.jackson.core")
-        exclude(group = "com.fasterxml.jackson.dataformat")
-    }
+    compileOnly(libs.swagger.annotations)
 
     testImplementation(libs.protobuf.java.util)
+    testImplementation(libs.opentelemetry.sdk.testing)
     testImplementation(project(":pulsar-functions:pulsar-functions-api-examples"))
 }
 
 // NAR/JAR files needed by tests (mirrors Maven's maven-dependency-plugin config).
-// Resolve through dependency configurations instead of cross-project task references.
-val testNars by configurations.creating {
-    isCanBeResolved = true
-    isCanBeConsumed = false
-    attributes {
-        attribute(ArtifactTypeDefinition.ARTIFACT_TYPE_ATTRIBUTE, "nar")
-    }
-}
-val testExamplesJar by configurations.creating {
-    isCanBeResolved = true
-    isCanBeConsumed = false
-}
+val testNars = projectNars("testNars",
+    ":pulsar-functions:pulsar-functions-api-examples-builtin",
+    ":pulsar-io:pulsar-io-data-generator")
+val testExamplesJar = projectJars("testExamplesJar", ":pulsar-functions:pulsar-functions-api-examples")
 
-dependencies {
-    testNars(project(":pulsar-functions:pulsar-functions-api-examples-builtin"))
-    testNars(project(":pulsar-io:pulsar-io-data-generator"))
-    testExamplesJar(project(":pulsar-functions:pulsar-functions-api-examples"))
-}
-
-tasks.withType<Test> {
-    dependsOn(testNars, testExamplesJar)
-    // Map resolved NAR/JAR files to system properties
-    val narFiles = testNars.incoming.artifacts.resolvedArtifacts
-    val jarFiles = testExamplesJar.incoming.artifacts.resolvedArtifacts
-    doFirst {
-        val narMap = narFiles.get().associate {
-            val id = it.id.componentIdentifier as org.gradle.api.artifacts.component.ProjectComponentIdentifier
-            id.projectPath to it.file.absolutePath
-        }
-        val examplesJarPath = jarFiles.get().first().file.absolutePath
-        systemProperty("pulsar-functions-api-examples.jar.path", examplesJarPath)
-        systemProperty("pulsar-functions-api-examples.nar.path",
-            narMap[":pulsar-functions:pulsar-functions-api-examples-builtin"]!!)
-        systemProperty("pulsar-io-data-generator.nar.path",
-            narMap[":pulsar-io:pulsar-io-data-generator"]!!)
+tasks.withType<Test>().configureEach {
+    // Inputs, which builds the archives before the tests run, and passed to the tests as system properties
+    inputs.files(testNars.files).withPropertyName("testNars").withPathSensitivity(PathSensitivity.NONE)
+    inputs.files(testExamplesJar.files).withPropertyName("testExamplesJar").withPathSensitivity(PathSensitivity.NONE)
+    jvmArgumentProviders.add(TestArchivePaths(
+        testNars.files.flatMap { it.incoming.artifacts.resolvedArtifacts },
+        testExamplesJar.files.flatMap { it.incoming.artifacts.resolvedArtifacts },
+        mapOf(
+            "pulsar-functions-api-examples.nar.path" to ":pulsar-functions:pulsar-functions-api-examples-builtin",
+            "pulsar-io-data-generator.nar.path" to ":pulsar-io:pulsar-io-data-generator",
+        ),
         // A valid jar that is not a valid nar — used for invalid-nar tests
-        systemProperty("pulsar-io-invalid.nar.path", examplesJarPath)
-    }
+        listOf("pulsar-functions-api-examples.jar.path", "pulsar-io-invalid.nar.path"),
+    ))
 }

@@ -23,37 +23,26 @@ plugins {
 
 dependencies {
     implementation(libs.slog)
-    compileOnly(project(":pulsar-client-tools"))
-    compileOnly(project(":pulsar-broker"))
 
     testImplementation(project(":pulsar-client-tools"))
     testImplementation(project(":pulsar-broker"))
-    testImplementation(project(path = ":pulsar-broker", configuration = "testJar"))
+    testImplementation(testJar(":pulsar-broker"))
     testImplementation(project(":testmocks"))
     testImplementation(libs.awaitility)
     testImplementation(libs.jackson.databind)
     testImplementation(libs.guava)
     testImplementation(project(":pulsar-client-admin-original"))
     testImplementation(project(":pulsar-client-original"))
+    testImplementation(project(":pulsar-client-api-v5"))
     testImplementation(project(":pulsar-functions:pulsar-functions-api"))
     testImplementation(libs.picocli)
+    testCompileOnly(libs.swagger.annotations)
 }
 
-// Copy the custom commands NAR from the example module into test resources
-val copyCustomCommandsNar by tasks.registering(Copy::class) {
-    dependsOn(":pulsar-client-tools-customcommand-example:nar")
-    from(project(":pulsar-client-tools-customcommand-example").layout.buildDirectory.dir("libs"))
-    include("customCommands-nar.nar")
-    into(layout.buildDirectory.dir("resources/test/cliextensions"))
-}
-
-tasks.withType<Test> {
-    dependsOn(copyCustomCommandsNar)
-}
-
-// checkstyleTest also scans test resources — ensure NAR copy runs first
-plugins.withId("checkstyle") {
-    tasks.named("checkstyleTest") {
-        dependsOn(copyCustomCommandsNar)
+// Add the custom commands NAR of the example module to the test resources
+val customCommandsNar = projectNars("customCommandsNar", ":pulsar-client-tools-customcommand-example")
+tasks.named<ProcessResources>("processTestResources") {
+    from(customCommandsNar.files) {
+        into("cliextensions")
     }
 }

@@ -34,6 +34,7 @@ import lombok.Setter;
 import lombok.ToString;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.pulsar.broker.authorization.PulsarAuthorizationProvider;
+import org.apache.pulsar.broker.tls.TlsFactorySupport;
 import org.apache.pulsar.common.configuration.Category;
 import org.apache.pulsar.common.configuration.FieldContext;
 import org.apache.pulsar.common.configuration.PropertiesContext;
@@ -42,7 +43,7 @@ import org.apache.pulsar.common.configuration.PulsarConfiguration;
 import org.apache.pulsar.common.nar.NarClassLoader;
 import org.apache.pulsar.common.protocol.Commands;
 import org.apache.pulsar.common.sasl.SaslConstants;
-import org.apache.pulsar.common.util.DefaultPulsarSslFactory;
+import org.apache.pulsar.common.tls.TlsClientAuthMode;
 
 
 @Getter
@@ -331,9 +332,18 @@ public class ProxyConfiguration implements PulsarConfiguration {
 
     @FieldContext(
             category = CATEGORY_KEYSTORE_TLS,
-            doc = "Specify the TLS provider for the web service, available values can be SunJSSE, Conscrypt and etc."
+            doc = "Specify the TLS provider for the web service, available values can be SunJSSE, Conscrypt and etc.\n"
+                    + "This names a JSSE (SSLContext) security provider for a Jetty-based web service, which has\n"
+                    + "no native TLS engine, so Netty engine values (JDK, OPENSSL, OPENSSL_REFCNT) are not valid\n"
+                    + "provider names here. The proxy's own HTTPS listener prefers this setting and falls back to\n"
+                    + "tlsProvider when it is unset, matching the broker. Leave unset (the default) to use\n"
+                    + "Conscrypt when it is available on this\n"
+                    + "platform, else the JVM's default provider; a configured name is pinned and startup fails\n"
+                    + "if it cannot be resolved. Conscrypt ships native libraries for x86_64 and, since 2.6.1,\n"
+                    + "aarch64 — but not for every platform, which is why the default falls back instead of failing\n"
+                    + "where it cannot load; pinning it explicitly there does fail."
     )
-    private String webServiceTlsProvider = "Conscrypt";
+    private String webServiceTlsProvider = "";
 
     @FieldContext(
             category = CATEGORY_TLS,
@@ -351,7 +361,10 @@ public class ProxyConfiguration implements PulsarConfiguration {
 
     @FieldContext(
             category = CATEGORY_SERVER,
-            doc = "The directory where nar Extraction happens"
+            doc = "The directory where nar packages are extracted. Default is java.io.tmpdir. Outside of Kubernetes,"
+                + " OS cleanup of /tmp (for example, by systemd-tmpfiles) can delete extracted files while the proxy is"
+                + " running, which causes ClassNotFoundException or NoClassDefFoundError errors. In that case, set"
+                + " this to a dedicated directory that isn't cleaned up automatically."
     )
     private String narExtractionDirectory = NarClassLoader.DEFAULT_NAR_EXTRACTION_DIR;
 
@@ -405,7 +418,7 @@ public class ProxyConfiguration implements PulsarConfiguration {
             + "Authentication must be enabled via configuring `authenticationEnabled` to be true for this"
             + "to take effect"
     )
-    private boolean forwardAuthorizationCredentials = false;
+    private boolean forwardAuthorizationCredentials = true;
 
     @FieldContext(
             category = CATEGORY_AUTHENTICATION,
@@ -561,7 +574,8 @@ public class ProxyConfiguration implements PulsarConfiguration {
     private boolean tlsEnabledInProxy = false;
     @FieldContext(
         category = CATEGORY_TLS,
-        doc = "Tls cert refresh duration in seconds (set 0 to check on every new connection)"
+        doc = "Tls cert refresh duration in seconds. Set 0 to disable the background rotation "
+            + "check, so the TLS material loaded at startup is kept until restart."
     )
     private long tlsCertRefreshCheckDurationSec = 300; // 5 mins
     @FieldContext(
@@ -592,9 +606,11 @@ public class ProxyConfiguration implements PulsarConfiguration {
     private boolean tlsAllowInsecureConnection = false;
     @FieldContext(
         category = CATEGORY_TLS,
-        doc = "Whether the hostname is validated when the proxy creates a TLS connection with brokers"
+        doc = "Whether the hostname is validated when the proxy creates a TLS connection with brokers."
+                + " Enabled by default since Pulsar 5.0 (PIP-478): a broker whose certificate does not match"
+                + " its hostname/SAN is rejected."
     )
-    private boolean tlsHostnameVerificationEnabled = false;
+    private boolean tlsHostnameVerificationEnabled = true;
     @FieldContext(
         category = CATEGORY_TLS,
         doc = "Specify the tls protocols the broker will use to negotiate during TLS handshake"
@@ -611,10 +627,33 @@ public class ProxyConfiguration implements PulsarConfiguration {
     private Set<String> tlsCiphers = new TreeSet<>();
     @FieldContext(
         category = CATEGORY_TLS,
-        doc = "Whether client certificates are required for TLS.\n\n"
-            + " Connections are rejected if the client certificate isn't trusted"
+        deprecated = true,
+        doc = "Deprecated: use tlsClientAuthMode=REQUIRE instead. Whether a trusted client certificate "
+            + "is required; the connection is rejected if the client certificate is missing or not "
+            + "trusted. Setting it to true together with tlsClientAuthMode=NONE or OPTIONAL is a "
+            + "configuration error."
     )
+    @Deprecated
     private boolean tlsRequireTrustedClientCertOnConnect = false;
+
+    @FieldContext(
+        category = CATEGORY_TLS,
+        doc = "Whether the TLS listeners ask connecting clients for a certificate (TLS client "
+            + "authentication): NONE does not request one, OPTIONAL requests one and accepts a "
+            + "connection without it (a presented certificate must be trusted), REQUIRE requires a "
+            + "trusted certificate.\n\n"
+            + "When unset, it is REQUIRE if the deprecated tlsRequireTrustedClientCertOnConnect is "
+            + "true, OPTIONAL if authentication is enabled with AuthenticationProviderTls among the "
+            + "authenticationProviders, and NONE otherwise. A custom authentication provider that reads "
+            + "the client certificate needs OPTIONAL or REQUIRE. Setting NONE while "
+            + "AuthenticationProviderTls is enabled is a configuration error.\n\n"
+            + "Requesting a certificate sends every client the names of all CAs in "
+            + "tlsTrustCertsFilePath or tlsTrustStore, or of the JVM default trust store when neither is "
+            + "set. With a large trust store, the TLS 1.3 handshake then spans several TLS records, which "
+            + "some clients fail to handle, so the trust store should hold only the CAs that issue client "
+            + "certificates."
+    )
+    private TlsClientAuthMode tlsClientAuthMode = null;
 
     // KeyStore TLS config variables
 
@@ -628,9 +667,36 @@ public class ProxyConfiguration implements PulsarConfiguration {
             category = CATEGORY_KEYSTORE_TLS,
             doc = "Specify the TLS provider for the broker service: \n"
                     + "When using TLS authentication with CACert, the valid value is either OPENSSL or JDK.\n"
-                    + "When using TLS authentication with KeyStore, available values can be SunJSSE, Conscrypt and etc."
+                    + "When using TLS authentication with KeyStore, available values can be SunJSSE, Conscrypt\n"
+                    + "and etc.\n"
+                    + "Leave unset (the default) to let Pulsar choose the engine: the native OpenSSL engine when a\n"
+                    + "netty-tcnative binary is available for the platform, otherwise the JDK engine.\n"
+                    + "This key is overloaded across two axes. An engine literal (JDK, OPENSSL, OPENSSL_REFCNT)\n"
+                    + "selects the TLS engine; any other value is read as a JSSE (SSLContext) provider name (e.g.\n"
+                    + "Conscrypt) and selects no native engine."
     )
     private String tlsProvider = null;
+
+    @FieldContext(
+            category = CATEGORY_TLS,
+            doc = "PIP-478: the name of a JSSE (SSLContext) provider — a java.security.Provider that supplies "
+                    + "an SSLContext (TLS) implementation (e.g. the BouncyCastle JSSE provider BCJSSE for FIPS, "
+                    + "with BCFIPS registered separately as the crypto provider it uses) — used to build the "
+                    + "proxy's server-side (binary front-end / web) TLS SSLContext. A distinct axis from "
+                    + "tlsProvider (the JDK-vs-OpenSSL engine switch): when set, the default factory builds the "
+                    + "JDK engine with this provider as the SSLContext provider, overriding the engine choice. "
+                    + "Resolved by preferring a provider already registered in the JVM (Security.getProvider), "
+                    + "falling back to the ServiceLoader mechanism, and failing loudly when unresolvable.")
+    private String jsseProvider = null;
+
+    @FieldContext(
+            category = CATEGORY_TLS,
+            doc = "PIP-478: the name of a JCA (material) provider — a java.security.Provider supplying the "
+                    + "KeyStore, CertificateFactory and KeyFactory engines that parse the TLS material (e.g. "
+                    + "BCFIPS for FIPS, alongside jsseProvider=BCJSSE). A distinct axis from jsseProvider, "
+                    + "which supplies the SSLContext: JSSE service types are never taken from this provider. "
+                    + "Unset uses the JVM provider search order. Applies to the proxy's listeners.")
+    private String jcaProvider = null;
 
     @FieldContext(
             category = CATEGORY_KEYSTORE_TLS,
@@ -670,13 +736,18 @@ public class ProxyConfiguration implements PulsarConfiguration {
 
     @FieldContext(
             category = CATEGORY_TLS,
-            doc = "SSL Factory Plugin class to provide SSLEngine and SSLContext objects. The default "
-                    + " class used is DefaultSslFactory.")
-    private String sslFactoryPlugin = DefaultPulsarSslFactory.class.getName();
+            doc = "PIP-478 TLS factory (PulsarTlsFactory) class name for the proxy's server-side TLS "
+                    + "(binary front-end and web server; purposes PROXY/WEB). An empty value or the literal "
+                    + "'default' selects the built-in default factory composed from these tls* settings, "
+                    + "otherwise the named class is instantiated via its public no-arg constructor. This is "
+                    + "the only server TLS path; the removed PIP-337 sslFactoryPlugin keys are rejected at "
+                    + "startup when set to a non-default value.")
+    private String tlsFactoryClassName = "";
     @FieldContext(
             category = CATEGORY_TLS,
-            doc = "SSL Factory plugin configuration parameters.")
-    private String sslFactoryPluginParams = "";
+            doc = "PIP-478 configuration parameters for tlsFactoryClassName. Accepts a JSON object or a "
+                    + "comma-separated key=value list.")
+    private String tlsFactoryConfig = "";
 
     /**
      * KeyStore TLS config variables used for proxy to auth with broker.
@@ -691,6 +762,25 @@ public class ProxyConfiguration implements PulsarConfiguration {
             doc = "The TLS Provider used by the Pulsar proxy to authenticate with Pulsar brokers"
     )
     private String brokerClientSslProvider = null;
+
+    @FieldContext(
+            category = CATEGORY_TLS,
+            doc = "PIP-478: the name of a JSSE (SSLContext) provider — a java.security.Provider that supplies "
+                    + "an SSLContext (TLS) implementation (e.g. the BouncyCastle JSSE provider BCJSSE for FIPS, "
+                    + "with BCFIPS registered separately as the crypto provider it uses) — used to build the "
+                    + "proxy's own outbound (proxy-to-broker) client TLS SSLContext. When set, the default "
+                    + "factory builds the JDK engine with this provider as the SSLContext provider, overriding "
+                    + "the engine choice. Resolved by preferring a provider already registered in the JVM "
+                    + "(Security.getProvider), falling back to the ServiceLoader mechanism, and failing loudly "
+                    + "when unresolvable.")
+    private String brokerClientJsseProvider = null;
+
+    @FieldContext(
+            category = CATEGORY_TLS,
+            doc = "PIP-478: the JCA (material) provider for the proxy's own outbound (proxy-to-broker) "
+                    + "client connections — the outbound counterpart of jcaProvider, on the same axis. "
+                    + "Unset uses the JVM provider search order.")
+    private String brokerClientJcaProvider = null;
 
     // needed when client auth is required
     @FieldContext(
@@ -749,13 +839,19 @@ public class ProxyConfiguration implements PulsarConfiguration {
 
     @FieldContext(
             category = CATEGORY_TLS,
-            doc = "SSL Factory Plugin class used by internal client to provide SSLEngine and SSLContext objects. "
-                    + "The default class used is DefaultSslFactory.")
-    private String brokerClientSslFactoryPlugin = DefaultPulsarSslFactory.class.getName();
+            doc = "PIP-478 TLS factory (PulsarTlsFactory) class name for the proxy's own outbound "
+                    + "(proxy-to-broker) client connections (purpose BROKER_CLIENT). An empty value or the "
+                    + "literal 'default' selects the built-in default factory composed from the brokerClient "
+                    + "tls* settings, otherwise the named class is instantiated via its public no-arg "
+                    + "constructor. This is the only outbound-client TLS path; the removed PIP-337 "
+                    + "brokerClientSslFactoryPlugin keys are rejected at startup when set to a non-default "
+                    + "value.")
+    private String brokerClientTlsFactoryClassName = "";
     @FieldContext(
             category = CATEGORY_TLS,
-            doc = "SSL Factory plugin configuration parameters used by internal client.")
-    private String brokerClientSslFactoryPluginParams = "";
+            doc = "PIP-478 configuration parameters for brokerClientTlsFactoryClassName. Accepts a JSON "
+                    + "object or a comma-separated key=value list.")
+    private String brokerClientTlsFactoryConfig = "";
 
     // HTTP
 
@@ -789,6 +885,19 @@ public class ProxyConfiguration implements PulsarConfiguration {
               """
     )
     private int httpMaxRequestHeaderSize = 8 * 1024;
+
+    @FieldContext(
+            minValue = 1,
+            category = CATEGORY_HTTP,
+            doc = """
+                The maximum size in bytes of the response header.
+                Larger headers will allow for larger response headers such as message properties
+                in the Admin API message inspection endpoints (getMessageById, peekNthMessage,
+                examineMessage). However, larger headers consume more memory and can make a server
+                more vulnerable to denial of service attacks.
+              """
+    )
+    private int httpMaxResponseHeaderSize = 8 * 1024;
 
     @FieldContext(
             minValue = 1,
@@ -1084,5 +1193,34 @@ public class ProxyConfiguration implements PulsarConfiguration {
 
     public boolean isMetadataStoreAllowReadOnlyOperations() {
         return zooKeeperAllowReadOnlyOperations || metadataStoreAllowReadOnlyOperations;
+    }
+
+    /**
+     * The effective TLS client-auth mode of the TLS listeners, resolved from {@code tlsClientAuthMode}, the
+     * deprecated {@code tlsRequireTrustedClientCertOnConnect} and the authentication settings; see
+     * {@link TlsFactorySupport#resolveClientAuthMode}.
+     *
+     * @return the effective mode
+     * @throws IllegalArgumentException if the settings conflict
+     */
+    @SuppressWarnings("deprecation")
+    public TlsClientAuthMode resolveTlsClientAuthMode() {
+        return TlsFactorySupport.resolveClientAuthMode(tlsClientAuthMode, tlsRequireTrustedClientCertOnConnect,
+                authenticationEnabled, authenticationProviders);
+    }
+
+    /**
+     * Resolve the effective TLS client-auth mode like {@link #resolveTlsClientAuthMode()} and log it with where it
+     * came from; see {@link TlsFactorySupport#logClientAuthMode}. Called once when a component with a TLS listener
+     * starts.
+     *
+     * @param component the component name for the log
+     * @return the effective mode
+     * @throws IllegalArgumentException if the settings conflict
+     */
+    @SuppressWarnings("deprecation")
+    public TlsClientAuthMode logTlsClientAuthMode(String component) {
+        return TlsFactorySupport.logClientAuthMode(component, tlsClientAuthMode, tlsRequireTrustedClientCertOnConnect,
+                authenticationEnabled, authenticationProviders);
     }
 }

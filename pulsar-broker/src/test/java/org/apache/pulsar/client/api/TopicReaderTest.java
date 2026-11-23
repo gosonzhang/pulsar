@@ -56,6 +56,7 @@ import org.apache.pulsar.client.impl.TopicMessageIdImpl;
 import org.apache.pulsar.client.impl.TopicMessageImpl;
 import org.apache.pulsar.common.policies.data.TopicStats;
 import org.apache.pulsar.common.util.RelativeTimeUtil;
+import org.awaitility.Awaitility;
 import org.testng.Assert;
 import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.DataProvider;
@@ -487,6 +488,7 @@ public class TopicReaderTest extends SharedPulsarBaseTest {
 
         // Write one sync message to ensure everything before got persistend
         producer.send("my-message-10".getBytes());
+        @Cleanup
         Reader<byte[]> reader1 = pulsarClient.newReader()
                 .topic(topicName)
                 .startMessageId(MessageId.earliest).create();
@@ -501,6 +503,7 @@ public class TopicReaderTest extends SharedPulsarBaseTest {
 
         System.out.println("CREATING READER ON MSG ID: " + lastMessageId);
 
+        @Cleanup
         Reader<byte[]> reader2 = pulsarClient.newReader()
                 .topic(topicName)
                 .startMessageId(lastMessageId).create();
@@ -1291,8 +1294,9 @@ public class TopicReaderTest extends SharedPulsarBaseTest {
             testMessageOrderAndDuplicates(messageSetB, receivedMessage, expectedMessage);
         }
 
-        // Reader should be finished
-        assertTrue(reader.isConnected());
+        // Reader should be finished. seek() triggers an asynchronous reconnect of the underlying consumer(s), so
+        // isConnected() can be transiently false right after the post-seek reads; await it to avoid flakiness.
+        Awaitility.await().untilAsserted(() -> assertTrue(reader.isConnected()));
         assertFalse(reader.hasMessageAvailable());
         assertEquals(((ReaderImpl) reader).getConsumer().numMessagesInQueue(), 0);
 
@@ -1337,8 +1341,9 @@ public class TopicReaderTest extends SharedPulsarBaseTest {
             Assert.assertTrue(messageSetB.add(receivedMessage), "Received duplicate message " + receivedMessage);
         }
 
-        // Reader should be finished
-        assertTrue(reader.isConnected());
+        // Reader should be finished. seek() triggers an asynchronous reconnect of the underlying consumer(s), so
+        // isConnected() can be transiently false right after the post-seek reads; await it to avoid flakiness.
+        Awaitility.await().untilAsserted(() -> assertTrue(reader.isConnected()));
         assertFalse(reader.hasMessageAvailable());
         assertEquals(((MultiTopicsReaderImpl) reader).getMultiTopicsConsumer().numMessagesInQueue(), 0);
 
@@ -1392,8 +1397,9 @@ public class TopicReaderTest extends SharedPulsarBaseTest {
             testMessageOrderAndDuplicates(messageSetB, receivedMessage, expectedMessage);
         }
 
-        // Reader should be finished
-        assertTrue(reader.isConnected());
+        // Reader should be finished. seek() triggers an asynchronous reconnect of the underlying consumer(s), so
+        // isConnected() can be transiently false right after the post-seek reads; await it to avoid flakiness.
+        Awaitility.await().untilAsserted(() -> assertTrue(reader.isConnected()));
         assertFalse(reader.hasMessageAvailable());
         assertEquals(((ReaderImpl) reader).getConsumer().numMessagesInQueue(), 0);
 

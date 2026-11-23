@@ -67,6 +67,19 @@ public interface LoadManager {
      */
     Optional<ResourceUnit> getLeastLoaded(ServiceUnitId su) throws Exception;
 
+    /**
+     * Asynchronous version of {@link #getLeastLoaded(ServiceUnitId)}.
+     * The default implementation calls the synchronous method on the caller's thread. Implementations should override
+     * this method to avoid blocking the caller on metadata reads.
+     */
+    default CompletableFuture<Optional<ResourceUnit>> getLeastLoadedAsync(ServiceUnitId su) {
+        try {
+            return CompletableFuture.completedFuture(getLeastLoaded(su));
+        } catch (Exception e) {
+            return CompletableFuture.failedFuture(e);
+        }
+    }
+
     default CompletableFuture<Optional<LookupResult>> findBrokerServiceUrl(
             Optional<ServiceUnitId> topic, ServiceUnitId bundle, LookupOptions options) {
         throw new UnsupportedOperationException();
@@ -150,35 +163,31 @@ public interface LoadManager {
     void initialize(PulsarService pulsar);
 
     static LoadManager create(final PulsarService pulsar) {
-        try {
-            final ServiceConfiguration conf = pulsar.getConfiguration();
+        final ServiceConfiguration conf = pulsar.getConfiguration();
 
-            String loadManagerClassName = conf.getLoadManagerClassName();
-            if (StringUtils.isBlank(loadManagerClassName)) {
-                loadManagerClassName = SimpleLoadManagerImpl.class.getName();
-            }
-
-            // Assume there is a constructor with one argument of PulsarService.
-            final Object loadManagerInstance = Reflections.createInstance(loadManagerClassName,
-                    Thread.currentThread().getContextClassLoader());
-            if (loadManagerInstance instanceof LoadManager casted) {
-                casted.initialize(pulsar);
-                return casted;
-            } else if (loadManagerInstance instanceof ModularLoadManager modularLoadManager) {
-                final LoadManager casted = new ModularLoadManagerWrapper(modularLoadManager);
-                casted.initialize(pulsar);
-                return casted;
-            } else if (loadManagerInstance instanceof ExtensibleLoadManager) {
-                final LoadManager casted =
-                        new ExtensibleLoadManagerWrapper((ExtensibleLoadManagerImpl) loadManagerInstance);
-                casted.initialize(pulsar);
-                return casted;
-            }
-        } catch (Exception e) {
-            LOG.warn().exception(e).log("Error when trying to create load manager");
+        String loadManagerClassName = conf.getLoadManagerClassName();
+        if (StringUtils.isBlank(loadManagerClassName)) {
+            loadManagerClassName = SimpleLoadManagerImpl.class.getName();
         }
-        // If we failed to create a load manager, default to SimpleLoadManagerImpl.
-        return new SimpleLoadManagerImpl(pulsar);
+
+        // Assume there is a constructor with one argument of PulsarService.
+        final Object loadManagerInstance = Reflections.createInstance(loadManagerClassName,
+                Thread.currentThread().getContextClassLoader());
+        if (loadManagerInstance instanceof LoadManager casted) {
+            casted.initialize(pulsar);
+            return casted;
+        } else if (loadManagerInstance instanceof ModularLoadManager modularLoadManager) {
+            final LoadManager casted = new ModularLoadManagerWrapper(modularLoadManager);
+            casted.initialize(pulsar);
+            return casted;
+        } else if (loadManagerInstance instanceof ExtensibleLoadManager) {
+            final LoadManager casted =
+                    new ExtensibleLoadManagerWrapper((ExtensibleLoadManagerImpl) loadManagerInstance);
+            casted.initialize(pulsar);
+            return casted;
+        } else {
+            throw new IllegalArgumentException(loadManagerClassName + " is not a supported LoadManager");
+        }
     }
 
 }

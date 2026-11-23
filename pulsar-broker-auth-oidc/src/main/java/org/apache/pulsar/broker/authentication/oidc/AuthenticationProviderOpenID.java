@@ -47,6 +47,8 @@ import java.net.SocketAddress;
 import java.security.PublicKey;
 import java.security.interfaces.ECPublicKey;
 import java.security.interfaces.RSAPublicKey;
+import java.time.DateTimeException;
+import java.time.Duration;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -57,18 +59,20 @@ import okhttp3.OkHttpClient;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.pulsar.broker.ServiceConfiguration;
 import org.apache.pulsar.broker.authentication.AuthenticationDataSource;
-import org.apache.pulsar.broker.authentication.AuthenticationProvider;
 import org.apache.pulsar.broker.authentication.AuthenticationProviderToken;
 import org.apache.pulsar.broker.authentication.AuthenticationState;
+import org.apache.pulsar.broker.authentication.TokenAuthenticationProvider;
 import org.apache.pulsar.broker.authentication.metrics.AuthenticationMetrics;
+import org.apache.pulsar.broker.authentication.utils.AuthTokenUtils;
 import org.apache.pulsar.common.api.AuthData;
+import org.apache.pulsar.common.util.FutureUtil;
 import org.asynchttpclient.AsyncHttpClient;
 import org.asynchttpclient.AsyncHttpClientConfig;
 import org.asynchttpclient.DefaultAsyncHttpClient;
 import org.asynchttpclient.DefaultAsyncHttpClientConfig;
 
 /**
- * An {@link AuthenticationProvider} implementation that supports the usage of a JSON Web Token (JWT)
+ * A {@link TokenAuthenticationProvider} implementation that supports the usage of a JSON Web Token (JWT)
  * for client authentication. This implementation retrieves the PublicKey from the JWT issuer (assuming the
  * issuer is in the configured allowed list) and then uses that Public Key to verify the validity of the JWT's
  * signature.
@@ -85,9 +89,8 @@ import org.asynchttpclient.DefaultAsyncHttpClientConfig;
  * this RFC: https://datatracker.ietf.org/doc/html/rfc7518#section-3.1.
  */
 @CustomLog
-public class AuthenticationProviderOpenID implements AuthenticationProvider {
+public class AuthenticationProviderOpenID implements TokenAuthenticationProvider {
     // Must match the value used by the OAuth2 Client Plugin.
-    private static final String AUTH_METHOD_NAME = "token";
 
     // This is backed by an ObjectMapper, which is thread safe. It is an optimization
     // to share this for decoding JWTs for all connections to this broker.
@@ -168,9 +171,9 @@ public class AuthenticationProviderOpenID implements AuthenticationProvider {
         this.issuers = validateIssuers(getConfigValueAsSet(config, ALLOWED_TOKEN_ISSUERS), requireHttps,
                 fallbackDiscoveryMode != FallbackDiscoveryMode.DISABLED);
 
-        int connectionTimeout = getConfigValueAsInt(config, HTTP_CONNECTION_TIMEOUT_MILLIS,
+        int connectionTimeoutMs = getConfigValueAsInt(config, HTTP_CONNECTION_TIMEOUT_MILLIS,
                 HTTP_CONNECTION_TIMEOUT_MILLIS_DEFAULT);
-        int readTimeout = getConfigValueAsInt(config, HTTP_READ_TIMEOUT_MILLIS, HTTP_READ_TIMEOUT_MILLIS_DEFAULT);
+        int readTimeoutMs = getConfigValueAsInt(config, HTTP_READ_TIMEOUT_MILLIS, HTTP_READ_TIMEOUT_MILLIS_DEFAULT);
         String trustCertsFilePath = getConfigValueAsString(config, ISSUER_TRUST_CERTS_FILE_PATH, null);
         SslContext sslContext = null;
         // When config is in the conf file but is empty, it defaults to the empty string, which is not meaningful and
@@ -183,8 +186,8 @@ public class AuthenticationProviderOpenID implements AuthenticationProvider {
         }
         AsyncHttpClientConfig clientConfig = new DefaultAsyncHttpClientConfig.Builder()
                 .setCookieStore(null)
-                .setConnectTimeout(connectionTimeout)
-                .setReadTimeout(readTimeout)
+                .setConnectTimeout(Duration.ofMillis(connectionTimeoutMs))
+                .setReadTimeout(Duration.ofMillis(readTimeoutMs))
                 .setSslContext(sslContext)
                 .build();
         httpClient = new DefaultAsyncHttpClient(clientConfig);
@@ -201,6 +204,13 @@ public class AuthenticationProviderOpenID implements AuthenticationProvider {
     @Override
     public void incrementFailureMetric(Enum<?> errorCode) {
         authenticationMetrics.recordFailure(errorCode);
+    }
+
+    @Override
+    public CompletableFuture<Set<String>> authenticateRolesAsync(AuthenticationDataSource authData, String roleClaim) {
+        return FutureUtil.supplySafely(() -> authenticateTokenAsync(authData)
+                .thenApply(jwt -> AuthTokenUtils.rolesFromClaim(
+                        jwt.getClaim(roleClaim).as(Object.class))));
     }
 
     /**
@@ -229,7 +239,8 @@ public class AuthenticationProviderOpenID implements AuthenticationProvider {
             incrementFailureMetric(AuthenticationExceptionCode.ERROR_DECODING_JWT);
             return CompletableFuture.failedFuture(e);
         }
-        return authenticateToken(token)
+        // Unexpected runtime exceptions must fail the returned future instead of escaping to the caller
+        return FutureUtil.supplySafely(() -> authenticateToken(token))
                 .whenComplete((jwt, e) -> {
                     if (jwt != null) {
                         authenticationMetrics.recordSuccess();
@@ -291,7 +302,7 @@ public class AuthenticationProviderOpenID implements AuthenticationProvider {
         }
         try {
             return jwtLibrary.decodeJwt(token);
-        } catch (JWTDecodeException e) {
+        } catch (JWTDecodeException | DateTimeException e) {
             incrementFailureMetric(AuthenticationExceptionCode.ERROR_DECODING_JWT);
             throw new AuthenticationException("Unable to decode JWT: " + e.getMessage());
         }
@@ -467,7 +478,7 @@ public class AuthenticationProviderOpenID implements AuthenticationProvider {
         } catch (AlgorithmMismatchException e) {
             incrementFailureMetric(AuthenticationExceptionCode.ALGORITHM_MISMATCH);
             throw new AuthenticationException("JWT algorithm does not match Public Key algorithm: " + e.getMessage());
-        } catch (JWTDecodeException e) {
+        } catch (JWTDecodeException | DateTimeException e) {
             incrementFailureMetric(AuthenticationExceptionCode.ERROR_DECODING_JWT);
             throw new AuthenticationException("Error while decoding JWT: " + e.getMessage());
         } catch (JWTVerificationException | IllegalArgumentException e) {

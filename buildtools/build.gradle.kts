@@ -21,13 +21,18 @@ plugins {
     id("pulsar.java-conventions")
 }
 
+// External consumers may use the test support classes without publishing them in normal releases.
+if (PulsarApiSpiPublication.isEnabled(project)) {
+    apply(plugin = "pulsar.public-java-library-conventions")
+}
+
 dependencies {
     implementation(libs.slog)
     implementation(libs.snakeyaml)
     implementation(libs.ant)
     implementation(libs.guava)
     implementation(libs.guice)
-    implementation(libs.testng) {
+    api(libs.testng) {
         exclude(group = "org.slf4j")
     }
     implementation(libs.log4j.api)
@@ -36,7 +41,7 @@ dependencies {
     implementation(libs.jcl.over.slf4j)
     implementation(libs.commons.lang3)
 
-    // Netty is needed at runtime for ExtendedNettyLeakDetector and FastThreadLocalCleanupListener.
+    // Netty is needed at runtime for ExtendedNettyLeakDetector.
     // Using runtimeOnly so it propagates transitively when other modules depend on buildtools.
     compileOnly(libs.netty.common)
     runtimeOnly(libs.netty.common)
@@ -49,7 +54,7 @@ dependencies {
     testRuntimeOnly(libs.netty.buffer)
 }
 
-tasks.withType<Test> {
+tasks.withType<Test>().configureEach {
     // Exclude inner classes used as test fixtures by BetweenTestClassesListenerAdapterTest.
     // They are run programmatically inside the test, not meant to be discovered directly.
     exclude("**/BetweenTestClassesListenerAdapterTest\$*")

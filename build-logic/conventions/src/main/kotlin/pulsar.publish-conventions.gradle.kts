@@ -17,18 +17,27 @@
  * under the License.
  */
 
-// Convention plugin for publishing Pulsar modules to Maven repositories.
-// Configures maven-publish, GPG signing, POM metadata, sources/javadoc JARs,
-// and a local deploy repository for testing.
+// Convention plugin for the Maven PUBLICATION of each published Pulsar module: the software
+// component, POM metadata, sources/javadoc JARs, and the artifactId. The publish repositories
+// (local + ASF Nexus), GPG signing, the upload-serialization lock and the snapshot/release
+// validation are shared with the root parent-POM project via pulsar.publish-repositories-conventions.
 
 plugins {
-    `maven-publish`
-    signing
+    id("pulsar.publish-repositories-conventions")
 }
 
-// --- java-library projects: JAR + sources + javadoc ---
+// --- java-library projects ---
+// The `maven` publication, without contents: what it publishes depends on the module's packaging,
+// and the convention plugin that defines the packaging adds it, see PulsarPublishing.kt:
+//   - pulsar.public-java-library-conventions: the `java` component, with sources and javadoc;
+//   - pulsar.public-shaded-library-conventions: the dependency-reduced `shadow` component, with
+//     sources and javadoc;
+//   - pulsar.nar-conventions: only the .nar archive.
+// That keeps this plugin independent of the order in which the plugins are applied.
 pluginManager.withPlugin("java-library") {
-    val sourceSets = the<SourceSetContainer>()
+    if (!PulsarApiSpiPublication.includes(project)) {
+        return@withPlugin
+    }
 
     // Match Maven's javadoc configuration: no doclint, don't fail on errors
     tasks.withType<Javadoc>().configureEach {
@@ -38,43 +47,31 @@ pluginManager.withPlugin("java-library") {
         isFailOnError = false
     }
 
-    val sourcesJar by tasks.registering(Jar::class) {
-        archiveClassifier.set("sources")
-        from(sourceSets["main"].allJava)
-    }
-
-    val javadocJar by tasks.registering(Jar::class) {
-        archiveClassifier.set("javadoc")
-        from(tasks.named(JavaPlugin.JAVADOC_TASK_NAME))
-    }
-
-    // Standard java-library modules: publish from components["java"]
-    publishing {
-        publications {
-            create<MavenPublication>("maven") {
-                from(components["java"])
-                artifact(sourcesJar)
-                artifact(javadocJar)
-
-                versionMapping {
-                    usage(Usage.JAVA_RUNTIME) {
-                        fromResolutionResult()
-                    }
-                    usage(Usage.JAVA_API) {
-                        fromResolutionOf("runtimeClasspath")
-                    }
-                }
+    publishing.publications.create<MavenPublication>(PULSAR_PUBLICATION) {
+        pom {
+            // dependencyManagement only belongs in platform POMs, whose dependencies ARE the
+            // management section.
+            withXml {
+                val sb = asString()
+                val s = sb.toString().replace(
+                    Regex("<dependencyManagement>.*?</dependencyManagement>", RegexOption.DOT_MATCHES_ALL),
+                    "",
+                )
+                sb.setLength(0)
+                sb.append(s)
             }
         }
     }
-
 }
 
 // --- java-platform projects (BOM, dependencies): POM-only, no JAR ---
 pluginManager.withPlugin("java-platform") {
+    if (!PulsarApiSpiPublication.includes(project)) {
+        return@withPlugin
+    }
     publishing {
         publications {
-            create<MavenPublication>("maven") {
+            create<MavenPublication>(PULSAR_PUBLICATION) {
                 from(components["javaPlatform"])
             }
         }
@@ -86,49 +83,48 @@ run {
     // Capture values in a local scope so withXml closures don't capture the script object
     // (which would break configuration cache serialization)
     val projectName = project.name
-    val projectDescription = project.description
-    val archivesNameValue = the<BasePluginExtension>().archivesName.get()
-    val isPlatformProject = plugins.hasPlugin("java-platform")
     val isRootProject = project == rootProject
     val pulsarVersion = version.toString()
-    val localDeployRepoDir = rootProject.layout.buildDirectory.dir("local-deploy-repo")
+    val pulsarGroup = project.group.toString()
+
+    // Per-module POM name and description. A provider, so that a description assigned in a
+    // module's build script body is picked up.
+    if (!isRootProject) {
+        val projectDescription = provider { project.description ?: "Apache Pulsar :: $projectName" }
+        publishing.publications.withType<MavenPublication>().configureEach {
+            pom {
+                name.set(projectDescription)
+                description.set(projectDescription)
+            }
+        }
+    }
+
+    // Publish under the name of the archives, which pulsar.java-conventions qualifies for nested
+    // modules. MavenPublication.artifactId is not lazy, so it is computed the same way rather than
+    // read from archivesName; a module that publishes under another name calls
+    // publishedArtifactId(...), which sets both. See PulsarPublishing.kt.
+    val defaultArtifactId = defaultArchivesName()
+    publishing.publications.withType<MavenPublication>().configureEach {
+        artifactId = defaultArtifactId
+    }
 
     publishing {
         publications {
             withType<MavenPublication>().configureEach {
-                artifactId = archivesNameValue
-
                 pom {
-                    // Per-module name and description
-                    if (!isRootProject) {
-                        name.set("Apache Pulsar :: $projectName")
-                        description.set(projectDescription ?: "Apache Pulsar :: $projectName")
-                    }
-
                     // Clean up POM XML and inject <parent> reference
                     withXml {
                         val sb = asString()
                         var s = sb.toString()
                         // <scope>compile</scope> is the Maven default — remove for cleaner POM
                         s = s.replace("<scope>compile</scope>", "")
-                        // Remove dependencyManagement from non-platform POMs
-                        // (platform POMs need it — their dependencies ARE the management section)
-                        if (!isPlatformProject) {
-                            s = s.replace(
-                                Regex(
-                                    "<dependencyManagement>.*?</dependencyManagement>",
-                                    RegexOption.DOT_MATCHES_ALL
-                                ),
-                                ""
-                            )
-                        }
                         // Inject <parent> reference for child modules (not the root/parent POM itself).
                         // Metadata (license, SCM, etc.) is inherited from the parent POM.
                         if (!isRootProject) {
                             s = s.replace(
                                 "<modelVersion>4.0.0</modelVersion>",
                                 "<modelVersion>4.0.0</modelVersion>\n  <parent>\n" +
-                                    "    <groupId>org.apache.pulsar</groupId>\n" +
+                                    "    <groupId>$pulsarGroup</groupId>\n" +
                                     "    <artifactId>pulsar</artifactId>\n" +
                                     "    <version>$pulsarVersion</version>\n" +
                                     "  </parent>"
@@ -142,40 +138,13 @@ run {
                 }
             }
         }
-
-        // Local Maven repository for testing/comparison
-        repositories {
-            maven {
-                name = "localDeploy"
-                url = uri(localDeployRepoDir)
-            }
-        }
     }
 }
 
-// --- GPG signing ---
-signing {
-    isRequired = !version.toString().endsWith("-SNAPSHOT")
-
-    val useGpgCmd = providers.gradleProperty("useGpgCmd").orNull?.toBoolean() ?: false
-    if (useGpgCmd) {
-        useGpgCmd()
-    }
-
-    sign(publishing.publications)
-}
-
-// Disable signing tasks when no key is configured (local dev without signing)
-tasks.withType<Sign>().configureEach {
-    enabled = providers.gradleProperty("signing.keyId").isPresent ||
-        providers.gradleProperty("signing.gnupg.keyName").isPresent
-}
-
-// Suppress enforced-platform validation: all java-library modules use
-// enforcedPlatform(":pulsar-dependencies") for internal version alignment,
-// but this should not leak to consumers. The dependencyManagement section
-// is stripped from published POMs via withXml above.
-tasks.withType<GenerateModuleMetadata>().configureEach {
-    suppressedValidationErrors.add("enforced-platform")
-}
+// NOTE: the enforced-platform validation error is intentionally NOT suppressed. The internal
+// version-alignment platform (:pulsar-dependencies) is declared on the non-published
+// `internalPlatform` bucket in pulsar.java-conventions (only the resolvable build classpaths
+// extend it), so it never reaches the published apiElements/runtimeElements variants. Letting the
+// validation run unsuppressed guards against the enforced platform regressing back into published
+// Gradle Module Metadata.
 

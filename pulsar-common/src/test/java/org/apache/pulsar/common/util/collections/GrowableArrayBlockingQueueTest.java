@@ -21,19 +21,69 @@ package org.apache.pulsar.common.util.collections;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertNull;
+import static org.testng.Assert.assertThrows;
 import static org.testng.Assert.assertTrue;
 import static org.testng.Assert.fail;
 import com.google.common.collect.Lists;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.testng.annotations.Test;
 
 public class GrowableArrayBlockingQueueTest {
+
+    @Test
+    public void arraySnapshotsPreserveOrderAcrossWrapAndGrowth() {
+        GrowableArrayBlockingQueue<Integer> queue = new GrowableArrayBlockingQueue<>(4);
+        queue.addAll(List.of(1, 2, 3, 4));
+        queue.poll();
+        queue.poll();
+        queue.addAll(List.of(5, 6));
+        Object[] wrapped = queue.toArray();
+        assertEquals(wrapped, new Object[]{3, 4, 5, 6});
+        queue.offer(7);
+        Integer[] target = {99, 99, 99, 99, 99, 99, 99};
+        assertTrue(queue.toArray(target) == target);
+        assertEquals(target, new Integer[]{3, 4, 5, 6, 7, null, 99});
+        queue.clear();
+        assertEquals(wrapped, new Object[]{3, 4, 5, 6});
+    }
+
+    @Test
+    public void executorShutdownDrainsTaskOfferedAfterInitialDrain() {
+        AtomicInteger executions = new AtomicInteger();
+        Runnable initial = executions::incrementAndGet;
+        Runnable late = executions::decrementAndGet;
+        AtomicBoolean injectLateOffer = new AtomicBoolean(true);
+        GrowableArrayBlockingQueue<Runnable> queue = new GrowableArrayBlockingQueue<>() {
+            @Override
+            public int drainTo(Collection<? super Runnable> target) {
+                int drained = super.drainTo(target);
+                // Model an in-flight execute() offer completing after shutdown's first drain.
+                if (injectLateOffer.getAndSet(false)) {
+                    offer(late);
+                }
+                return drained;
+            }
+        };
+        ThreadPoolExecutor executor = new ThreadPoolExecutor(1, 1, 0, TimeUnit.MILLISECONDS, queue);
+        queue.offer(initial);
+        try {
+            assertEquals(executor.shutdownNow(), List.of(initial, late));
+            assertTrue(queue.isEmpty());
+            assertTrue(executor.isTerminated());
+            assertEquals(executions.get(), 0);
+        } finally {
+            executor.shutdownNow();
+        }
+    }
 
     @Test
     public void simple() throws Exception {
@@ -387,5 +437,45 @@ public class GrowableArrayBlockingQueueTest {
         assertTrue(queue.remove(7));
         assertEquals(queue.size(), 1);
         assertEquals(queue.toString(), "[3]");
+    }
+
+    @Test
+    public void removeIfKeepsOrderAcrossWrap() {
+        GrowableArrayBlockingQueue<Integer> queue = new GrowableArrayBlockingQueue<>(4);
+        assertFalse(queue.removeIf(i -> true));
+
+        // Fill the array, with the items wrapping around its end
+        queue.addAll(List.of(1, 2, 3));
+        queue.poll();
+        queue.addAll(List.of(4, 5));
+        assertEquals(queue.capacity(), 4);
+        assertFalse(queue.removeIf(i -> i > 5));
+        assertTrue(queue.removeIf(i -> i % 2 == 0));
+        assertEquals(queue.size(), 2);
+        assertEquals(queue.toList(), List.of(3, 5));
+
+        // The slots of the removed items are reused
+        queue.addAll(List.of(6, 7));
+        assertEquals(queue.capacity(), 4);
+        assertEquals(queue.toList(), List.of(3, 5, 6, 7));
+
+        assertTrue(queue.removeIf(i -> true));
+        assertEquals(queue.size(), 0);
+        assertNull(queue.poll());
+        assertTrue(queue.offer(8));
+        assertEquals(queue.poll(), Integer.valueOf(8));
+    }
+
+    @Test
+    public void removeIfLeavesQueueUnchangedWhenFilterThrows() {
+        GrowableArrayBlockingQueue<Integer> queue = new GrowableArrayBlockingQueue<>(4);
+        queue.addAll(List.of(1, 2, 3));
+        assertThrows(IllegalStateException.class, () -> queue.removeIf(i -> {
+            if (i == 3) {
+                throw new IllegalStateException();
+            }
+            return true;
+        }));
+        assertEquals(queue.toList(), List.of(1, 2, 3));
     }
 }

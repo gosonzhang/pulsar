@@ -24,6 +24,7 @@ import static org.testng.AssertJUnit.assertNotNull;
 import static org.testng.AssertJUnit.assertNotSame;
 import static org.testng.AssertJUnit.assertSame;
 import static org.testng.AssertJUnit.assertTrue;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.List;
@@ -69,12 +70,15 @@ public class AuditorBookieTest extends BookKeeperClusterTestCase {
     @AfterMethod
     @Override
     public void tearDown() throws Exception {
-        stopAuditorElectors();
+        List<ParallelAuditorShutdown.Cleanup> cleanups = new ArrayList<>();
+        cleanups.add(() -> ParallelAuditorShutdown.shutdown(auditorElectors.values()));
+        cleanups.add(auditorElectors::clear);
         for (ZooKeeper zk : zkClients) {
-            zk.close();
+            cleanups.add(zk::close);
         }
-        zkClients.clear();
-        super.tearDown();
+        cleanups.add(zkClients::clear);
+        cleanups.add(() -> super.tearDown());
+        ParallelAuditorShutdown.cleanup(cleanups);
     }
 
     /**
@@ -133,13 +137,12 @@ public class AuditorBookieTest extends BookKeeperClusterTestCase {
             assertTrue("Auditor elector is not running!", auditorElector
                     .isRunning());
         }
-        stopBKCluster();
         stopAuditorElectors();
-
-        startBKCluster(zkUtil.getMetadataServiceUri());
-        //startBKCluster(zkUtil.getMetadataServiceUri()) override the base conf metadataServiceUri
-        baseConf.setMetadataServiceUri(
-                zkUtil.getMetadataServiceUri().replaceAll("zk://", "metadata-store:").replaceAll("/ledgers", ""));
+        // Restart the bookies while preserving their identities (host:port and data dirs).
+        // Tearing the cluster down and recreating bookies with fresh data dirs on recycled
+        // ports fails bookie cookie validation against the cookies that are still registered
+        // in the metadata store, which made this test flaky.
+        restartBookies();
         startAuditorElectors();
         BookieServer newAuditor = waitForNewAuditor(auditor);
         assertNotSame(
@@ -185,7 +188,7 @@ public class AuditorBookieTest extends BookKeeperClusterTestCase {
         ServerConfiguration serverConfiguration = shutdownBookie(auditor);
 
         auditorElectors.remove(addr);
-        startBookie(serverConfiguration);
+        startAndAddBookie(serverConfiguration);
         // starting corresponding auditor elector
 
         log.debug("Performing Auditor Election:" + addr);
@@ -216,9 +219,13 @@ public class AuditorBookieTest extends BookKeeperClusterTestCase {
 
     private void stopAuditorElectors() throws Exception {
         for (AuditorElector auditorElector : auditorElectors.values()) {
-            auditorElector.shutdown();
+            shutdownAuditorElector(auditorElector);
             log.debug("Stopping Auditor Elector!");
         }
+        // The same test instance is reused across test methods, so drop references to the
+        // shut-down electors. Otherwise a later method that iterates over auditorElectors
+        // (e.g. testBookieClusterRestart) would observe stale, already-stopped electors.
+        auditorElectors.clear();
     }
 
     private BookieServer verifyAuditor() throws Exception {
@@ -251,7 +258,7 @@ public class AuditorBookieTest extends BookKeeperClusterTestCase {
         ServerConfiguration conf = killBookie(index);
 
         // stopping corresponding auditor elector
-        auditorElectors.get(addr).shutdown();
+        shutdownAuditorElector(auditorElectors.get(addr));
         return conf;
     }
 

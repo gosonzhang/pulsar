@@ -29,6 +29,7 @@ import org.apache.pulsar.client.admin.PulsarAdminException.NotFoundException;
 import org.apache.pulsar.client.admin.PulsarAdminException.PreconditionFailedException;
 import org.apache.pulsar.client.api.SubscriptionType;
 import org.apache.pulsar.common.policies.data.AuthAction;
+import org.apache.pulsar.common.policies.data.AutoScalePolicyOverride;
 import org.apache.pulsar.common.policies.data.AutoSubscriptionCreationOverride;
 import org.apache.pulsar.common.policies.data.AutoTopicCreationOverride;
 import org.apache.pulsar.common.policies.data.BacklogQuota;
@@ -1144,6 +1145,7 @@ public interface Namespaces {
      *
      * @param namespace
      *            Namespace name
+     * @return the anti-affinity group name, or {@code null} if none is set
      *
      * @throws NotAuthorizedException
      *             Don't have admin permission
@@ -1165,6 +1167,7 @@ public interface Namespaces {
      *
      * @param namespace
      *            Namespace name
+     * @return the anti-affinity group name, or {@code null} if none is set
      */
     CompletableFuture<String> getNamespaceAntiAffinityGroupAsync(String namespace);
 
@@ -1365,6 +1368,72 @@ public interface Namespaces {
      *            Namespace name
      */
     CompletableFuture<Void> removeAutoTopicCreationAsync(String namespace);
+
+    /**
+     * Sets the scalable-topic auto split/merge policy override for a namespace (PIP-483),
+     * overriding the broker's defaults for every scalable topic in the namespace that does
+     * not carry its own per-topic override.
+     *
+     * @param namespace
+     *            Namespace name
+     * @param override
+     *            the override; unset fields fall through to the broker configuration
+     * @throws PulsarAdminException
+     *             Unexpected error
+     */
+    void setScalableTopicAutoScalePolicy(String namespace, AutoScalePolicyOverride override)
+            throws PulsarAdminException;
+
+    /**
+     * Sets the scalable-topic auto split/merge policy override for a namespace asynchronously.
+     *
+     * @param namespace
+     *            Namespace name
+     * @param override
+     *            the override; unset fields fall through to the broker configuration
+     */
+    CompletableFuture<Void> setScalableTopicAutoScalePolicyAsync(
+            String namespace, AutoScalePolicyOverride override);
+
+    /**
+     * Get the scalable-topic auto split/merge policy override for a namespace.
+     *
+     * @param namespace
+     *            Namespace name
+     * @return the override, or {@code null} if none is set
+     * @throws PulsarAdminException
+     *             Unexpected error
+     */
+    AutoScalePolicyOverride getScalableTopicAutoScalePolicy(String namespace) throws PulsarAdminException;
+
+    /**
+     * Get the scalable-topic auto split/merge policy override for a namespace asynchronously.
+     *
+     * @param namespace
+     *            Namespace name
+     * @return the override, or {@code null} if none is set
+     */
+    CompletableFuture<AutoScalePolicyOverride> getScalableTopicAutoScalePolicyAsync(String namespace);
+
+    /**
+     * Removes the scalable-topic auto split/merge policy override from a namespace, letting
+     * the broker configuration apply.
+     *
+     * @param namespace
+     *            Namespace name
+     * @throws PulsarAdminException
+     *             Unexpected error
+     */
+    void removeScalableTopicAutoScalePolicy(String namespace) throws PulsarAdminException;
+
+    /**
+     * Removes the scalable-topic auto split/merge policy override from a namespace
+     * asynchronously.
+     *
+     * @param namespace
+     *            Namespace name
+     */
+    CompletableFuture<Void> removeScalableTopicAutoScalePolicyAsync(String namespace);
 
     /**
      * Sets the autoSubscriptionCreation policy for a given namespace, overriding broker settings.
@@ -2165,7 +2234,7 @@ public interface Namespaces {
      * Get the replication configuration version for a given namespace.
      *
      * @param namespace
-     * @return Replication configuration version
+     * @return Replication configuration version, or {@code null} if none is set
      * @throws PulsarAdminException
      *             Unexpected error
      */
@@ -2175,7 +2244,7 @@ public interface Namespaces {
      * Get the replication configuration version for a given namespace asynchronously.
      *
      * @param namespace
-     * @return Replication configuration version
+     * @return Replication configuration version, or {@code null} if none is set
      */
     CompletableFuture<String> getReplicationConfigVersionAsync(String namespace);
 
@@ -4609,7 +4678,7 @@ public interface Namespaces {
      *             Namespace does not exist
      * @throws PulsarAdminException
      *             Unexpected error
-     * @return
+     * @return the resource group name, or {@code null} if none is set
      */
     String getNamespaceResourceGroup(String namespace) throws PulsarAdminException;
 
@@ -4624,6 +4693,7 @@ public interface Namespaces {
      *
      * @param namespace
      *            Namespace name
+     * @return the resource group name, or {@code null} if none is set
      */
     CompletableFuture<String> getNamespaceResourceGroupAsync(String namespace);
 

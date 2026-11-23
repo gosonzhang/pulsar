@@ -29,14 +29,17 @@ import static org.testng.Assert.assertTrue;
 import static org.testng.Assert.fail;
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.EventLoop;
 import io.netty.channel.EventLoopGroup;
 import io.netty.util.concurrent.DefaultThreadFactory;
+import io.netty.util.concurrent.EventExecutor;
 import java.lang.reflect.Field;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import org.apache.pulsar.client.api.PulsarClientException;
 import org.apache.pulsar.client.api.PulsarClientException.BrokerMetadataException;
@@ -46,6 +49,8 @@ import org.apache.pulsar.common.api.proto.CommandCloseConsumer;
 import org.apache.pulsar.common.api.proto.CommandCloseProducer;
 import org.apache.pulsar.common.api.proto.CommandConnected;
 import org.apache.pulsar.common.api.proto.CommandError;
+import org.apache.pulsar.common.api.proto.CommandLookupTopicResponse;
+import org.apache.pulsar.common.api.proto.CommandSendReceipt;
 import org.apache.pulsar.common.api.proto.CommandWatchTopicListSuccess;
 import org.apache.pulsar.common.api.proto.CommandWatchTopicUpdate;
 import org.apache.pulsar.common.api.proto.ServerError;
@@ -65,7 +70,7 @@ public class ClientCnxTest {
         conf.setOperationTimeoutMs(10);
         conf.setKeepAliveIntervalSeconds(0);
         ClientCnx cnx = new ClientCnx(InstrumentProvider.NOOP, conf, eventLoop);
-        ChannelHandlerContext ctx = ClientTestFixtures.mockChannelHandlerContext();
+        ChannelHandlerContext ctx = mockChannelHandlerContext(eventLoop.next());
         cnx.channelActive(ctx);
 
         try {
@@ -85,7 +90,7 @@ public class ClientCnxTest {
         conf.setOperationTimeoutMs(10_000);
         conf.setKeepAliveIntervalSeconds(0);
         ClientCnx cnx = new ClientCnx(InstrumentProvider.NOOP, conf, eventLoop);
-        ChannelHandlerContext ctx = ClientTestFixtures.mockChannelHandlerContext();
+        ChannelHandlerContext ctx = mockChannelHandlerContext(eventLoop.next());
         cnx.channelActive(ctx);
         CountDownLatch countDownLatch = new CountDownLatch(1);
         CompletableFuture<Exception> completableFuture = new CompletableFuture<>();
@@ -118,7 +123,7 @@ public class ClientCnxTest {
         conf.setOperationTimeoutMs(10_000);
         conf.setKeepAliveIntervalSeconds(0);
         ClientCnx cnx = new ClientCnx(InstrumentProvider.NOOP, conf, eventLoop);
-        ChannelHandlerContext ctx = ClientTestFixtures.mockChannelHandlerContext();
+        ChannelHandlerContext ctx = mockChannelHandlerContext(eventLoop.next());
         cnx.channelActive(ctx);
         cnx.state = ClientCnx.State.Ready;
         CountDownLatch countDownLatch = new CountDownLatch(1);
@@ -156,7 +161,7 @@ public class ClientCnxTest {
         conf.setOperationTimeoutMs(10_000);
         conf.setKeepAliveIntervalSeconds(0);
         ClientCnx cnx = new ClientCnx(InstrumentProvider.NOOP, conf, eventLoop);
-        ChannelHandlerContext ctx = ClientTestFixtures.mockChannelHandlerContext();
+        ChannelHandlerContext ctx = mockChannelHandlerContext(eventLoop.next());
         cnx.channelActive(ctx);
         for (int i = 0; i < 5001; i++) {
             cnx.newLookup(null, i);
@@ -293,6 +298,32 @@ public class ClientCnxTest {
     }
 
     @Test
+    public void testSendReceiptForRemovedProducerIsIgnored() {
+        ThreadFactory threadFactory = new DefaultThreadFactory("testSendReceiptForRemovedProducerIsIgnored");
+        EventLoopGroup eventLoop = EventLoopUtil.newEventLoopGroup(1, false, threadFactory);
+        ClientConfigurationData conf = new ClientConfigurationData();
+        ClientCnx cnx = new ClientCnx(InstrumentProvider.NOOP, conf, eventLoop);
+        cnx.state = ClientCnx.State.Ready;
+
+        // A receipt for a producer the broker has already told the client to close, as happens when
+        // its topic is terminated with sends in flight, is dropped rather than failing the connection.
+        long producerId = 1;
+        CommandSendReceipt receipt = new CommandSendReceipt()
+                .setProducerId(producerId)
+                .setSequenceId(5)
+                .setHighestSequenceId(5);
+        receipt.setMessageId().setLedgerId(3).setEntryId(7);
+        cnx.handleSendReceipt(receipt);
+
+        ProducerImpl<?> producer = mock(ProducerImpl.class);
+        cnx.registerProducer(producerId, producer);
+        cnx.handleSendReceipt(receipt);
+        verify(producer).ackReceived(cnx, 5, 5, 3, 7);
+
+        eventLoop.shutdownGracefully();
+    }
+
+    @Test
     public void testIdleCheckWithTopicListWatcher() {
         ClientCnx cnx =
                 new ClientCnx(InstrumentProvider.NOOP, new ClientConfigurationData(), mock(EventLoopGroup.class));
@@ -301,6 +332,26 @@ public class ClientCnxTest {
         cnx.registerTopicListWatcher(0, mock(TopicListWatcher.class));
         // idle check should now return false since there's a registered watcher
         assertFalse(cnx.idleCheck());
+    }
+
+    @Test
+    public void testScalableTopicSupportRequiresExplicitFeatureFlag() {
+        // Older brokers either omit feature flags entirely or advertise only older flags.
+        for (int mode = 0; mode < 4; mode++) {
+            CommandConnected connected = new CommandConnected()
+                    .setServerVersion("test")
+                    .setProtocolVersion(21);
+            if (mode == 1) {
+                connected.setFeatureFlags().setSupportsTopicWatchers(true);
+            } else if (mode >= 2) {
+                connected.setFeatureFlags().setSupportsScalableTopics(mode == 3);
+            }
+            boolean expectedSupport = mode == 3;
+            withConnection("testScalableTopicSupportRequiresExplicitFeatureFlag", cnx -> {
+                cnx.handleConnected(connected);
+                assertThat(cnx.isSupportsScalableTopics()).isEqualTo(expectedSupport);
+            });
+        }
     }
 
     @Test
@@ -371,6 +422,424 @@ public class ClientCnxTest {
             cnx.handleCommandWatchTopicUpdate(update);
             verify(watcher).handleCommandWatchTopicUpdate(update);
         });
+    }
+
+    /**
+     * Test that when a lookup request times out, the semaphore is properly released
+     * so that subsequent lookup requests can still be sent.
+     */
+    @Test
+    public void testLookupTimeoutReleasesSemaphore() throws Exception {
+        EventLoopGroup eventLoop = EventLoopUtil.newEventLoopGroup(1, false,
+                new DefaultThreadFactory("testLookupTimeoutReleasesSemaphore"));
+        try {
+            ClientConfigurationData conf = new ClientConfigurationData();
+            conf.setOperationTimeoutMs(10);
+            conf.setKeepAliveIntervalSeconds(0);
+            ClientCnx cnx = new ClientCnx(InstrumentProvider.NOOP, conf, eventLoop);
+            ChannelHandlerContext ctx = mockChannelHandlerContext(eventLoop.next());
+            cnx.channelActive(ctx);
+
+            int initialPermits = cnx.getPendingLookupRequestSemaphore().availablePermits();
+
+            // Send a lookup request that will time out
+            CompletableFuture<BinaryProtoLookupService.LookupDataResult> future =
+                    cnx.newLookup(null, 1L);
+
+            // Wait for the timeout to trigger
+            try {
+                future.get(2, TimeUnit.SECONDS);
+                fail("Should have timed out");
+            } catch (Exception e) {
+                assertTrue(e.getCause() instanceof PulsarClientException.TimeoutException);
+            }
+
+            // Verify semaphore is released back to initial permits
+            Awaitility.await().atMost(2, TimeUnit.SECONDS).untilAsserted(() -> {
+                assertEquals(cnx.getPendingLookupRequestSemaphore().availablePermits(), initialPermits);
+            });
+        } finally {
+            eventLoop.shutdownGracefully().sync();
+        }
+    }
+
+    /**
+     * Test that when a lookup request times out, waiting lookup requests in the queue
+     * are properly dispatched (the waiting queue is driven).
+     */
+    @Test
+    public void testLookupTimeoutDrivesWaitingQueue() throws Exception {
+        EventLoopGroup eventLoop = EventLoopUtil.newEventLoopGroup(1, false,
+                new DefaultThreadFactory("testLookupTimeoutDrivesWaitingQueue"));
+        try {
+            ClientConfigurationData conf = new ClientConfigurationData();
+            // concurrentLookupRequest=50 by default, maxLookupRequest=50000 by default
+            conf.setOperationTimeoutMs(50);
+            conf.setKeepAliveIntervalSeconds(0);
+            conf.setConcurrentLookupRequest(1); // Only allow 1 concurrent lookup
+            conf.setMaxLookupRequest(10);       // Allow up to 10 total (9 waiting)
+            ClientCnx cnx = new ClientCnx(InstrumentProvider.NOOP, conf, eventLoop);
+            ChannelHandlerContext ctx = mockChannelHandlerContext(eventLoop.next());
+            cnx.channelActive(ctx);
+            cnx.state = ClientCnx.State.Ready;
+
+            // First lookup occupies the only concurrent slot
+            CompletableFuture<BinaryProtoLookupService.LookupDataResult> firstFuture =
+                    cnx.newLookup(null, 1L);
+
+            // Second lookup should go into the waiting queue
+            CompletableFuture<BinaryProtoLookupService.LookupDataResult> secondFuture =
+                    cnx.newLookup(null, 2L);
+
+            // The second future should not be completed yet (it's waiting)
+            assertFalse(secondFuture.isDone());
+
+            // Wait for the first request to time out - this should drive the waiting queue
+            // and dispatch the second request
+            try {
+                firstFuture.get(2, TimeUnit.SECONDS);
+                fail("First future should have timed out");
+            } catch (Exception e) {
+                assertTrue(e.getCause() instanceof PulsarClientException.TimeoutException);
+            }
+
+            // After the first request times out, the second request should have been
+            // dispatched from the waiting queue (it will also eventually time out)
+            try {
+                secondFuture.get(2, TimeUnit.SECONDS);
+                fail("Second future should have timed out");
+            } catch (Exception e) {
+                assertTrue(e.getCause() instanceof PulsarClientException.TimeoutException);
+            }
+
+            // Verify all semaphores are properly released
+            Awaitility.await().atMost(2, TimeUnit.SECONDS).untilAsserted(() -> {
+                assertEquals(cnx.getPendingLookupRequestSemaphore().availablePermits(), 1);
+            });
+        } finally {
+            eventLoop.shutdownGracefully().sync();
+        }
+    }
+
+    /**
+     * Test that when multiple lookup requests time out, all waiting requests in the queue
+     * are eventually dispatched and no semaphore leak occurs.
+     */
+    @Test
+    public void testMultipleLookupTimeoutsNoSemaphoreLeak() throws Exception {
+        EventLoopGroup eventLoop = EventLoopUtil.newEventLoopGroup(1, false,
+                new DefaultThreadFactory("testMultipleLookupTimeoutsNoSemaphoreLeak"));
+        try {
+            ClientConfigurationData conf = new ClientConfigurationData();
+            conf.setOperationTimeoutMs(30);
+            conf.setKeepAliveIntervalSeconds(0);
+            conf.setConcurrentLookupRequest(2);  // Allow 2 concurrent lookups
+            conf.setMaxLookupRequest(10);        // Allow up to 10 total (8 waiting)
+            ClientCnx cnx = new ClientCnx(InstrumentProvider.NOOP, conf, eventLoop);
+            ChannelHandlerContext ctx = mockChannelHandlerContext(eventLoop.next());
+            cnx.channelActive(ctx);
+            cnx.state = ClientCnx.State.Ready;
+
+            // Send 5 lookup requests: 2 will be concurrent, 3 will be in waiting queue
+            CompletableFuture<?>[] futures = new CompletableFuture[5];
+            for (int i = 0; i < 5; i++) {
+                futures[i] = cnx.newLookup(null, i + 1L);
+            }
+
+            // Wait for all futures to complete (all should time out eventually)
+            for (int i = 0; i < 5; i++) {
+                try {
+                    futures[i].get(5, TimeUnit.SECONDS);
+                    fail("Future " + i + " should have timed out");
+                } catch (Exception e) {
+                    assertTrue(e.getCause() instanceof PulsarClientException.TimeoutException,
+                            "Future " + i + " should fail with TimeoutException but got: " + e.getCause());
+                }
+            }
+
+            // Verify all semaphore permits are released (no leak)
+            Awaitility.await().atMost(2, TimeUnit.SECONDS).untilAsserted(() -> {
+                assertEquals(cnx.getPendingLookupRequestSemaphore().availablePermits(), 2);
+            });
+        } finally {
+            eventLoop.shutdownGracefully().sync();
+        }
+    }
+
+    /**
+     * Test that when a failed lookup response is received,
+     * the semaphore permit is properly released via the unified cleanup primitive
+     * (removePendingRequest) without double-release.
+     */
+    @Test
+    public void testFailedLookupResponseReleasesSemaphore() throws Exception {
+        EventLoopGroup eventLoop = EventLoopUtil.newEventLoopGroup(1, false,
+                new DefaultThreadFactory("testFailedLookupResponseReleasesSemaphore"));
+        try {
+            ClientConfigurationData conf = new ClientConfigurationData();
+            conf.setOperationTimeoutMs(10_000);
+            conf.setKeepAliveIntervalSeconds(0);
+            ClientCnx cnx = new ClientCnx(InstrumentProvider.NOOP, conf, eventLoop);
+            ChannelHandlerContext ctx = mockChannelHandlerContext(eventLoop.next());
+            cnx.channelActive(ctx);
+            cnx.state = ClientCnx.State.Ready;
+
+            int initialPermits = cnx.getPendingLookupRequestSemaphore().availablePermits();
+
+            // Send a lookup request
+            CompletableFuture<BinaryProtoLookupService.LookupDataResult> future =
+                    cnx.newLookup(null, 1L);
+
+            // Simulate a failed lookup response (CommandLookupTopicResponse with Failed status)
+            CommandLookupTopicResponse lookupResponse = new CommandLookupTopicResponse();
+            lookupResponse.setRequestId(1L);
+            lookupResponse.setResponse(CommandLookupTopicResponse.LookupType.Failed);
+            lookupResponse.setError(ServerError.ServiceNotReady);
+            lookupResponse.setMessage("Service not ready");
+            cnx.handleLookupResponse(lookupResponse);
+
+            // Verify the future completed exceptionally
+            try {
+                future.get(2, TimeUnit.SECONDS);
+                fail("Should have failed");
+            } catch (Exception e) {
+                // expected
+            }
+
+            // Verify semaphore is released back to initial permits (no leak, no double-release)
+            // Previously this would cause availablePermits to be initialPermits+1 due to double-release
+            Awaitility.await().atMost(2, TimeUnit.SECONDS).untilAsserted(() -> {
+                assertEquals(cnx.getPendingLookupRequestSemaphore().availablePermits(), initialPermits);
+            });
+        } finally {
+            eventLoop.shutdownGracefully().sync();
+        }
+    }
+
+    /**
+     * Test that when the connection is closed while an active lookup request is pending,
+     * the semaphore permit is properly released.
+     */
+    @Test
+    public void testActiveRequestConnectionCloseReleasesSemaphore() throws Exception {
+        EventLoopGroup eventLoop = EventLoopUtil.newEventLoopGroup(1, false,
+                new DefaultThreadFactory("testActiveRequestConnectionCloseReleasesSemaphore"));
+        try {
+            ClientConfigurationData conf = new ClientConfigurationData();
+            conf.setOperationTimeoutMs(10_000);
+            conf.setKeepAliveIntervalSeconds(0);
+            ClientCnx cnx = new ClientCnx(InstrumentProvider.NOOP, conf, eventLoop);
+            ChannelHandlerContext ctx = mockChannelHandlerContext(eventLoop.next());
+            cnx.channelActive(ctx);
+
+            int initialPermits = cnx.getPendingLookupRequestSemaphore().availablePermits();
+
+            // Send a lookup request
+            CompletableFuture<BinaryProtoLookupService.LookupDataResult> future =
+                    cnx.newLookup(null, 1L);
+
+            // Simulate connection close
+            cnx.channelInactive(ctx);
+
+            // Verify the future completed exceptionally with ConnectException
+            try {
+                future.get(2, TimeUnit.SECONDS);
+                fail("Should have failed");
+            } catch (Exception e) {
+                assertTrue(e.getCause() instanceof PulsarClientException.ConnectException);
+            }
+
+            // Verify semaphore is released back to initial permits
+            Awaitility.await().atMost(2, TimeUnit.SECONDS).untilAsserted(() -> {
+                assertEquals(cnx.getPendingLookupRequestSemaphore().availablePermits(), initialPermits);
+            });
+        } finally {
+            eventLoop.shutdownGracefully().sync();
+        }
+    }
+
+    /**
+     * Test that when the connection is closed while a promoted waiting request is active,
+     * the semaphore permit is properly released and no leak occurs.
+     */
+    @Test
+    public void testPromotedWaitingRequestConnectionCloseReleasesSemaphore() throws Exception {
+        EventLoopGroup eventLoop = EventLoopUtil.newEventLoopGroup(1, false,
+                new DefaultThreadFactory("testPromotedWaitingRequestConnectionCloseReleasesSemaphore"));
+        try {
+            ClientConfigurationData conf = new ClientConfigurationData();
+            conf.setOperationTimeoutMs(10_000);
+            conf.setKeepAliveIntervalSeconds(0);
+            conf.setConcurrentLookupRequest(1); // Only allow 1 concurrent lookup
+            conf.setMaxLookupRequest(10);
+            ClientCnx cnx = new ClientCnx(InstrumentProvider.NOOP, conf, eventLoop);
+            ChannelHandlerContext ctx = mockChannelHandlerContext(eventLoop.next());
+            cnx.channelActive(ctx);
+            cnx.state = ClientCnx.State.Ready;
+
+            // First lookup occupies the only concurrent slot
+            CompletableFuture<BinaryProtoLookupService.LookupDataResult> firstFuture =
+                    cnx.newLookup(null, 1L);
+
+            // Second lookup goes into the waiting queue
+            CompletableFuture<BinaryProtoLookupService.LookupDataResult> secondFuture =
+                    cnx.newLookup(null, 2L);
+
+            // Simulate a failed lookup response for the first request, which promotes the second
+            CommandLookupTopicResponse failedResponse = new CommandLookupTopicResponse();
+            failedResponse.setRequestId(1L);
+            failedResponse.setResponse(CommandLookupTopicResponse.LookupType.Failed);
+            failedResponse.setError(ServerError.ServiceNotReady);
+            failedResponse.setMessage("Service not ready");
+            cnx.handleLookupResponse(failedResponse);
+
+            // Verify the first future completed exceptionally
+            assertTrue(firstFuture.isCompletedExceptionally());
+
+            // Wait for the second request to be promoted from the waiting queue
+            Awaitility.await().atMost(2, TimeUnit.SECONDS)
+                    .until(() -> cnx.pendingRequests.containsKey(2L));
+
+            // Now close the connection while the promoted request is active
+            cnx.channelInactive(ctx);
+
+            // Verify the second future completed exceptionally
+            try {
+                secondFuture.get(2, TimeUnit.SECONDS);
+                fail("Second future should have failed");
+            } catch (Exception e) {
+                assertTrue(e.getCause() instanceof PulsarClientException.ConnectException);
+            }
+
+            // Verify semaphore is released (1 permit for concurrentLookupRequest=1)
+            Awaitility.await().atMost(2, TimeUnit.SECONDS).untilAsserted(() -> {
+                assertEquals(cnx.getPendingLookupRequestSemaphore().availablePermits(), 1);
+            });
+        } finally {
+            eventLoop.shutdownGracefully().sync();
+        }
+    }
+
+    /**
+     * Test that when the channel goes inactive before the handshake completes, the connection future
+     * fails with ConnectException rather than a plain PulsarClientException, so that callers which
+     * classify on ConnectException (e.g. retryable end-txn checks) see the specific type.
+     */
+    @Test
+    public void testChannelInactiveFailsConnectionFutureWithConnectException() throws Exception {
+        EventLoopGroup eventLoop = EventLoopUtil.newEventLoopGroup(1, false,
+                new DefaultThreadFactory("testChannelInactiveFailsConnectionFutureWithConnectException"));
+        try {
+            ClientConfigurationData conf = new ClientConfigurationData();
+            conf.setOperationTimeoutMs(10_000);
+            conf.setKeepAliveIntervalSeconds(0);
+            ClientCnx cnx = new ClientCnx(InstrumentProvider.NOOP, conf, eventLoop);
+            ChannelHandlerContext ctx = mockChannelHandlerContext(eventLoop.next());
+            cnx.channelActive(ctx);
+
+            // The CONNECT frame has been sent but no CONNECTED response received, so the future is pending
+            assertFalse(cnx.connectionFuture().isDone());
+
+            cnx.channelInactive(ctx);
+
+            try {
+                cnx.connectionFuture().get(2, TimeUnit.SECONDS);
+                fail("Connection future should have failed");
+            } catch (ExecutionException e) {
+                assertTrue(e.getCause() instanceof PulsarClientException.ConnectException);
+            }
+        } finally {
+            eventLoop.shutdownGracefully().sync();
+        }
+    }
+
+    /**
+     * The request timeout task runs on the connection's own event loop. When a client shuts down, the other loops
+     * of its group can terminate before this one is done with its connections, so neither scheduling the task nor
+     * cancelling it may depend on them.
+     */
+    @Test
+    public void testRequestTimeoutTaskRunsOnConnectionEventLoop() throws Exception {
+        EventLoopGroup eventLoop = EventLoopUtil.newEventLoopGroup(1, false,
+                new DefaultThreadFactory("testRequestTimeoutTaskRunsOnConnectionEventLoop"));
+        try {
+            ClientConfigurationData conf = new ClientConfigurationData();
+            conf.setOperationTimeoutMs(10);
+            conf.setKeepAliveIntervalSeconds(0);
+            ClientCnx cnx = new ClientCnx(InstrumentProvider.NOOP, conf,
+                    terminatedEventLoopGroup("testRequestTimeoutTaskRunsOnConnectionEventLoop-other"));
+            ChannelHandlerContext ctx = mockChannelHandlerContext(eventLoop.next());
+            cnx.channelActive(ctx);
+
+            assertThat(cnx.newLookup(null, 1L)).failsWithin(10, TimeUnit.SECONDS)
+                    .withThrowableOfType(ExecutionException.class)
+                    .withCauseInstanceOf(PulsarClientException.TimeoutException.class);
+
+            cnx.channelInactive(ctx);
+        } finally {
+            eventLoop.shutdownGracefully();
+        }
+    }
+
+    /**
+     * A lookup response sends the next waiting lookup and, for a TooManyRequests error, schedules the reset of the
+     * connection's count of rejected requests. Both run on the connection's own event loop, so that the response
+     * still completes its lookup, and the waiting one still gets sent, while the other loops of the group terminate.
+     */
+    @Test
+    public void testLookupResponseHandOffsUseConnectionEventLoop() throws Exception {
+        EventLoopGroup eventLoop = EventLoopUtil.newEventLoopGroup(1, false,
+                new DefaultThreadFactory("testLookupResponseHandOffsUseConnectionEventLoop"));
+        try {
+            ClientConfigurationData conf = new ClientConfigurationData();
+            conf.setKeepAliveIntervalSeconds(0);
+            conf.setConcurrentLookupRequest(1);
+            conf.setMaxLookupRequest(2);
+            ClientCnx cnx = new ClientCnx(InstrumentProvider.NOOP, conf,
+                    terminatedEventLoopGroup("testLookupResponseHandOffsUseConnectionEventLoop-other"));
+            EventLoop connectionEventLoop = eventLoop.next();
+            cnx.setCtx(mockChannelHandlerContext(connectionEventLoop));
+            cnx.state = ClientCnx.State.Ready;
+
+            CompletableFuture<BinaryProtoLookupService.LookupDataResult> first = cnx.newLookup(null, 1L);
+            // Waits for the first lookup to complete
+            CompletableFuture<BinaryProtoLookupService.LookupDataResult> second = cnx.newLookup(null, 2L);
+
+            // Responses are handled on the connection's event loop, which runs the tasks they hand off in order
+            connectionEventLoop.submit(() -> cnx.handleLookupResponse(new CommandLookupTopicResponse()
+                    .setRequestId(1L)
+                    .setResponse(CommandLookupTopicResponse.LookupType.Failed)
+                    .setError(ServerError.TooManyRequests))).get(10, TimeUnit.SECONDS);
+            assertThat(first).failsWithin(0, TimeUnit.SECONDS)
+                    .withThrowableOfType(ExecutionException.class)
+                    .withCauseInstanceOf(PulsarClientException.TooManyRequestsException.class);
+
+            connectionEventLoop.submit(() -> cnx.handleLookupResponse(new CommandLookupTopicResponse()
+                    .setRequestId(2L)
+                    .setResponse(CommandLookupTopicResponse.LookupType.Connect)
+                    .setBrokerServiceUrl("pulsar://broker:6650"))).get(10, TimeUnit.SECONDS);
+            assertThat(second).isCompletedWithValueMatching(result -> "pulsar://broker:6650".equals(result.brokerUrl));
+        } finally {
+            eventLoop.shutdownGracefully();
+        }
+    }
+
+    /**
+     * Stands in for the other loops of a connection's event loop group, once they have terminated.
+     */
+    private static EventLoopGroup terminatedEventLoopGroup(String name) throws InterruptedException {
+        EventLoopGroup eventLoopGroup = EventLoopUtil.newEventLoopGroup(1, false, new DefaultThreadFactory(name));
+        eventLoopGroup.shutdownGracefully(0, 0, TimeUnit.SECONDS).sync();
+        return eventLoopGroup;
+    }
+
+    /**
+     * A mocked context whose executor stands in for the connection's own event loop.
+     */
+    private static ChannelHandlerContext mockChannelHandlerContext(EventExecutor executor) {
+        ChannelHandlerContext ctx = ClientTestFixtures.mockChannelHandlerContext();
+        when(ctx.executor()).thenReturn(executor);
+        return ctx;
     }
 
     private void withConnection(String testName, Consumer<ClientCnx> test) {

@@ -18,6 +18,12 @@
  */
 package org.apache.pulsar.broker.admin;
 
+import jakarta.ws.rs.client.Client;
+import jakarta.ws.rs.client.ClientBuilder;
+import jakarta.ws.rs.client.Entity;
+import jakarta.ws.rs.client.WebTarget;
+import jakarta.ws.rs.core.MediaType;
+import jakarta.ws.rs.core.Response;
 import java.io.BufferedReader;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -25,12 +31,6 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
-import javax.ws.rs.client.Client;
-import javax.ws.rs.client.ClientBuilder;
-import javax.ws.rs.client.Entity;
-import javax.ws.rs.client.WebTarget;
-import javax.ws.rs.core.MediaType;
-import javax.ws.rs.core.Response;
 import lombok.Cleanup;
 import lombok.CustomLog;
 import org.apache.pulsar.broker.auth.MockedPulsarServiceBaseTest;
@@ -88,6 +88,15 @@ public class AdminRestTest extends MockedPulsarServiceBaseTest {
         response1.close();
         response2.close();
         response3.close();
+    }
+
+    @Test
+    public void testUnsetNamespaceGroupsAreNull() throws Exception {
+        Assert.assertNull(admin.namespaces().getNamespaceResourceGroup(namespaceName));
+        Assert.assertNull(admin.namespaces().getNamespaceAntiAffinityGroup(namespaceName));
+
+        admin.namespaces().setNamespaceAntiAffinityGroup(namespaceName, "my-group");
+        Assert.assertEquals(admin.namespaces().getNamespaceAntiAffinityGroup(namespaceName), "my-group");
     }
 
     private String parseResponseEntity(Object entity) throws Exception {

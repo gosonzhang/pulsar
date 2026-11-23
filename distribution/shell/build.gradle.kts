@@ -17,6 +17,8 @@
  * under the License.
  */
 
+import org.gradle.api.artifacts.component.ProjectComponentIdentifier
+
 plugins {
     id("pulsar.java-conventions")
     id("pulsar.binary-license-check-conventions")
@@ -27,29 +29,40 @@ tasks.named("compileTestJava") { enabled = false }
 tasks.named("jar") { enabled = false }
 val nettyTcnativeVersion: String = libs.versions.netty.tcnative.get()
 val bookkeeperVersion: String = libs.versions.bookkeeper.get()
-val distLib by configurations.creating {
-    isCanBeResolved = true
-    isCanBeConsumed = false
-    isTransitive = true
-    // Inherit version constraints from the enforced platform (via implementation)
-    extendsFrom(configurations["implementation"])
+// The runtime dependencies that the distribution bundles: declared in distLib, resolved with their
+// dependencies in distLibFiles (see ProjectArtifacts.kt)
+val distLibArtifacts = runtimeJars("distLibFiles", "distLib")
+val distLib = distLibArtifacts.dependencies
+val distLibFiles = distLibArtifacts.files
+distLibFiles.configure {
+    // Inherit the enforced version-alignment platform so bundled dependency versions match the
+    // version catalog (the platform lives on the non-published `internalPlatform` bucket from
+    // pulsar.java-conventions; `implementation` no longer carries it).
+    extendsFrom(configurations["implementation"], configurations["internalPlatform"])
     exclude(group = "org.projectlombok", module = "lombok")
     // Exclude jars not in the shell distribution
     exclude(group = "javax.xml.bind", module = "jaxb-api")
     exclude(group = "net.java.dev.jna", module = "jna")
     exclude(group = "net.java.dev.jna", module = "jna-platform")
     exclude(group = "io.netty", module = "netty-transport-native-kqueue")
-    exclude(group = "io.prometheus", module = "simpleclient_caffeine")
+    // The full fastutil jar (~24MB) is replaced by :pulsar-client-fastutil-minimized below,
+    // which ships only the fastutil classes the client-side modules actually use.
+    exclude(group = "it.unimi.dsi", module = "fastutil")
 }
 dependencies {
     distLib(project(":pulsar-client-tools"))
+    // Minimized fastutil (replaces the full fastutil jar excluded from distLib above): only the
+    // fastutil classes reachable from the client-side modules (client, client-tools, admin).
+    distLib(project(":pulsar-client-fastutil-minimized"))
     distLib(libs.log4j.core)
     distLib(libs.log4j.web)
     distLib(libs.log4j.layout.template.json)
     distLib(libs.log4j.slf4j2.impl)
+    distLib(libs.log4j.jul)
     distLib(libs.simpleclient.log4j2)
-    // Bouncy Castle
-    distLib(project(":bouncy-castle:bouncy-castle-bc"))
+    // Bouncy Castle (non-FIPS JCA provider for client-side message crypto + TLS)
+    distLib(libs.bcprov.jdk18on)
+    distLib(libs.bcpkix.jdk18on)
     // conscrypt (in Maven shell dist)
     distLib(libs.conscrypt.openjdk.uber)
     // swagger-annotations (in Maven shell dist)
@@ -66,19 +79,17 @@ dependencies {
     }
 }
 val pulsarVersion = project.version.toString()
-val rootDir = rootProject.projectDir
-val shellDistTar by tasks.registering(Tar::class) {
+val shellDistTar = tasks.register<Tar>("shellDistTar") {
+    group = "distribution"
+    description = "Builds the Pulsar shell distribution tarball"
     val baseDir = "apache-pulsar-shell-${pulsarVersion}"
-    val renameMap = distLib.incoming.artifacts.resolvedArtifacts.map { artifacts ->
+    val renameMap = distLibFiles.flatMap { it.incoming.artifacts.resolvedArtifacts }.map { artifacts ->
         artifacts.associate { result ->
             val id = result.id.componentIdentifier
             val file = result.file
             val newName = when (id) {
-                is org.gradle.api.artifacts.component.ProjectComponentIdentifier -> {
-                    var mappedName = file.nameWithoutExtension
-                    if (mappedName.startsWith("bouncy-castle-bc-")) {
-                        mappedName = mappedName + "-pkg"
-                    }
+                is ProjectComponentIdentifier -> {
+                    val mappedName = file.nameWithoutExtension
                     "${mappedName}.${file.extension}"
                 }
                 else -> file.name
@@ -129,7 +140,7 @@ val shellDistTar by tasks.registering(Tar::class) {
         into("${baseDir}/conf")
     }
     // Runtime dependency JARs
-    from(distLib) {
+    from(distLibFiles) {
         into("${baseDir}/lib")
         exclude("**/*.nar")
     }
@@ -141,18 +152,17 @@ val shellDistTar by tasks.registering(Tar::class) {
         }
     }
 }
-val shellDistZip by tasks.registering(Zip::class) {
+val shellDistZip = tasks.register<Zip>("shellDistZip") {
+    group = "distribution"
+    description = "Builds the Pulsar shell distribution zip"
     val baseDir = "apache-pulsar-shell-${pulsarVersion}"
-    val renameMap = distLib.incoming.artifacts.resolvedArtifacts.map { artifacts ->
+    val renameMap = distLibFiles.flatMap { it.incoming.artifacts.resolvedArtifacts }.map { artifacts ->
         artifacts.associate { result ->
             val id = result.id.componentIdentifier
             val file = result.file
             val newName = when (id) {
-                is org.gradle.api.artifacts.component.ProjectComponentIdentifier -> {
-                    var mappedName = file.nameWithoutExtension
-                    if (mappedName.startsWith("bouncy-castle-bc-")) {
-                        mappedName = mappedName + "-pkg"
-                    }
+                is ProjectComponentIdentifier -> {
+                    val mappedName = file.nameWithoutExtension
                     "${mappedName}.${file.extension}"
                 }
                 else -> file.name
@@ -199,7 +209,7 @@ val shellDistZip by tasks.registering(Zip::class) {
     from(rootDir.resolve("conf/log4j2.yaml")) {
         into("${baseDir}/conf")
     }
-    from(distLib) {
+    from(distLibFiles) {
         into("${baseDir}/lib")
         exclude("**/*.nar")
     }
@@ -220,13 +230,17 @@ binaryLicenseCheck {
 
 // Export the runtime classpath to a file for bin/ scripts to use
 // when running Pulsar CLI tools from a development build
-val exportClasspath by tasks.registering {
+val exportClasspath = tasks.register("exportClasspath") {
+    group = "build"
+    description = "Writes the distribution's runtime classpath to build/classpath.txt for the bin/ scripts"
     val outputFile = layout.buildDirectory.file("classpath.txt")
+    val classpath = files(distLibFiles)
+    inputs.files(classpath).withPropertyName("classpath").withNormalizer(ClasspathNormalizer::class.java)
     outputs.file(outputFile)
     doLast {
         outputFile.get().asFile.apply {
             parentFile.mkdirs()
-            writeText(distLib.asPath)
+            writeText(classpath.asPath)
         }
     }
 }

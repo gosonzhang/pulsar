@@ -58,6 +58,10 @@ public class ConnectionHandler {
     protected final int randomKeyForSelectConnection;
 
     private volatile Boolean useProxy;
+    // The explicit target broker for connections that bypass topic lookup (v5 TC metadata-store
+    // discovery). Remembered so the error-retry path (reconnectLater) re-dials the same leader
+    // instead of falling back to the service URL. Null means "use the normal lookup path".
+    private volatile URI explicitHostURI;
 
     interface Connection {
 
@@ -94,6 +98,18 @@ public class ConnectionHandler {
 
     protected void grabCnx() {
         grabCnx(Optional.empty());
+    }
+
+    /**
+     * Connect to a specific broker {@code hostURI}, routing through the proxy when {@code useProxy}
+     * is true (logical = the broker, physical = the proxy) or directly otherwise. Used by the v5
+     * transaction coordinator's metadata-store discovery, where the elected leader's address is
+     * known but, behind a proxy, isn't directly reachable.
+     */
+    protected void grabCnx(URI hostURI, boolean useProxy) {
+        this.useProxy = useProxy;
+        this.explicitHostURI = hostURI;
+        grabCnx(Optional.of(hostURI));
     }
 
     protected void grabCnx(Optional<URI> hostURI) {
@@ -189,7 +205,15 @@ public class ConnectionHandler {
         if (state.changeToConnecting()) {
             state.client.timer().newTimeout(timeout -> {
                 log.info("Reconnecting after connection was closed");
-                grabCnx();
+                // Re-dial the explicit leader target (v5 TC discovery) if set; otherwise the normal
+                // lookup path. Without this, a first-attempt failure during failover would fall back
+                // to the service URL and never reach the partition's new leader.
+                URI target = explicitHostURI;
+                if (target != null) {
+                    grabCnx(Optional.of(target));
+                } else {
+                    grabCnx();
+                }
             }, delayMs, TimeUnit.MILLISECONDS);
         } else {
             log.info("Ignoring reconnection request");
@@ -203,6 +227,15 @@ public class ConnectionHandler {
     public void connectionClosed(ClientCnx cnx, Optional<Long> initialConnectionDelayMs, Optional<URI> hostUrl) {
         lastConnectionClosedTimestamp = System.currentTimeMillis();
         duringConnect.set(false);
+        // Only handlers already pinned to an explicit host (v5 TC metadata-store discovery) update
+        // the pin here, so a later first-attempt failure (reconnectLater) re-dials the current
+        // leader rather than falling back to the service URL. For lookup-based handlers
+        // (producers/consumers), the broker-assigned redirect in hostUrl may be wrong or stale:
+        // it is honored for the immediate reconnect attempt below only, and retries after a
+        // failure go through a fresh topic lookup instead of staying pinned to it.
+        if (explicitHostURI != null) {
+            hostUrl.ifPresent(uri -> this.explicitHostURI = uri);
+        }
         state.client.getCnxPool().releaseConnection(cnx);
         if (CLIENT_CNX_UPDATER.compareAndSet(this, cnx, null)) {
             if (!state.changeToConnecting()) {
@@ -236,14 +269,34 @@ public class ConnectionHandler {
     }
 
     /**
-     * Update the {@link ClientCnx} for the class, then increment and get the epoch value. Note that the epoch value is
-     * currently only used by the {@link ProducerImpl}.
+     * Update the {@link ClientCnx} for the class, then increment and get the epoch value. The epoch identifies the
+     * connection attempt, see {@link #isSupersededAttempt}.
      * @param clientCnx - the new {@link ClientCnx}
-     * @return the epoch value to use for this pair of {@link ClientCnx} and {@link ProducerImpl}
+     * @return the epoch value to use for this pair of {@link ClientCnx} and handler
      */
     protected long switchClientCnx(ClientCnx clientCnx) {
         setClientCnx(clientCnx);
         return EPOCH_UPDATER.incrementAndGet(this);
+    }
+
+    /**
+     * Whether the connection attempt that {@link #switchClientCnx} started on {@code cnx} with {@code epoch} has been
+     * superseded: the handler has since been disconnected from {@code cnx}, or has started another attempt. The
+     * response to a superseded attempt can arrive after the handler is connected again, so it must not change the
+     * handler.
+     */
+    boolean isSupersededAttempt(ClientCnx cnx, long epoch) {
+        return cnx() != cnx || getEpoch() != epoch;
+    }
+
+    /**
+     * Ends the connection attempt that {@link #switchClientCnx} started on {@code cnx} with {@code epoch}, if it is
+     * still the current one, and tells whether it was. The handler is then left without a connection, so a
+     * disconnection from {@code cnx} no longer reconnects it: only completing the failed attempt does. The caller
+     * must hold the lock under which it calls {@link #switchClientCnx}.
+     */
+    boolean endAttempt(ClientCnx cnx, long epoch) {
+        return getEpoch() == epoch && CLIENT_CNX_UPDATER.compareAndSet(this, cnx, null);
     }
 
     @VisibleForTesting

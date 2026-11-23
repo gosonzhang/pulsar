@@ -23,6 +23,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.testng.Assert.assertEquals;
 import com.google.common.collect.Sets;
 import io.opentelemetry.sdk.testing.assertj.OpenTelemetryAssertions;
+import jakarta.ws.rs.container.AsyncResponse;
+import jakarta.ws.rs.container.TimeoutHandler;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.net.InetSocketAddress;
@@ -40,8 +42,6 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
-import javax.ws.rs.container.AsyncResponse;
-import javax.ws.rs.container.TimeoutHandler;
 import lombok.AllArgsConstructor;
 import lombok.CustomLog;
 import lombok.Data;
@@ -398,6 +398,9 @@ public abstract class MockedPulsarServiceBaseTest extends TestRetrySupport {
         log.info().attr("brokerServiceUrl", pulsar.getBrokerServiceUrl())
                 .attr("webServiceAddress", pulsar.getWebServiceAddress())
                 .log("Stopping Pulsar broker");
+        // Close the admin client first: the broker's graceful web service stop would wait for its idle connections
+        // to time out (1 s). startBroker() creates a new one.
+        closeAdmin();
         pulsar.close();
         pulsar = null;
         // Simulate cleanup of ephemeral nodes
@@ -411,8 +414,9 @@ public abstract class MockedPulsarServiceBaseTest extends TestRetrySupport {
         this.pulsar = pulsarTestContext.getPulsarService();
         afterPulsarStart(pulsar);
 
-        brokerUrl = pulsar.getWebServiceAddress() != null ? new URL(pulsar.getWebServiceAddress()) : null;
-        brokerUrlTls = pulsar.getWebServiceAddressTls() != null ? new URL(pulsar.getWebServiceAddressTls()) : null;
+        brokerUrl = pulsar.getWebServiceAddress() != null ? URI.create(pulsar.getWebServiceAddress()).toURL() : null;
+        brokerUrlTls = pulsar.getWebServiceAddressTls() != null
+                ? URI.create(pulsar.getWebServiceAddressTls()).toURL() : null;
 
         URI newLookupUrl = resolveLookupUrl();
         if (lookupUrl == null || !newLookupUrl.equals(lookupUrl)) {
@@ -627,7 +631,7 @@ public abstract class MockedPulsarServiceBaseTest extends TestRetrySupport {
         }
     }
 
-    protected Object asyncRequests(Consumer<TestAsyncResponse> function) throws Exception {
+    public static Object asyncRequests(Consumer<TestAsyncResponse> function) throws Exception {
         TestAsyncResponse ctx = new TestAsyncResponse();
         function.accept(ctx);
         ctx.latch.await();
@@ -734,7 +738,9 @@ public abstract class MockedPulsarServiceBaseTest extends TestRetrySupport {
     public static void deleteNamespaceWithRetry(String ns, boolean force, PulsarAdmin admin) throws Exception {
         Awaitility.await()
                 .atMost(20, TimeUnit.SECONDS)
-                .pollDelay(500, TimeUnit.MILLISECONDS)
+                // Try the first delete right away: the poll delay is a wait before the first attempt, not between
+                // retries
+                .pollDelay(0, TimeUnit.MILLISECONDS)
                 .until(() -> {
             try {
                 // Maybe fail by race-condition with create topics, just retry.

@@ -42,7 +42,6 @@ import java.util.TimerTask;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiConsumer;
 import java.util.stream.Collectors;
 import lombok.Cleanup;
@@ -133,6 +132,14 @@ public class TestReplicationWorker extends BookKeeperClusterTestCase {
         baseConf.setZkTimeout(7000);
         baseConf.setZkRetryBackoffMaxMs(500);
         baseConf.setZkRetryBackoffStartMs(10);
+        // The tests let the workers fail while the bookies with the entries are down. After a failure, a worker
+        // waits rwRereplicateBackoffMs (5 s by default) before its next attempt, and holds on to the ledger lock
+        // for 1/32 of the grace period (9.4 s by default), twice as long on each further failure.
+        baseConf.setRwRereplicateBackoffMs(100);
+        baseConf.setLockReleaseOfFailedLedgerGracePeriod("64");
+        // A read of several entries schedules a speculative read for each of them, but only cancels the last one
+        // when it completes, so closing the client would wait for the others to time out (2 s by default)
+        baseClientConf.setSpeculativeReadTimeout(0);
     }
 
     @BeforeMethod
@@ -552,28 +559,18 @@ public class TestReplicationWorker extends BookKeeperClusterTestCase {
             rw1.start();
             rw2.start();
 
-            AtomicBoolean isBookieRestarted = new AtomicBoolean(false);
-
-            (new Thread(new Runnable() {
-                @Override
-                public void run() {
-                    try {
-                        Thread.sleep(3000);
-                        isBookieRestarted.set(true);
-                        /*
-                         * after sleeping for 3000 msecs, restart one of the
-                         * bookie, so that replication can succeed.
-                         */
-                        startBookie(killedBookiesConfig[0]);
-                    } catch (Exception e) {
-                        e.printStackTrace();
-                    }
-                }
-            })).start();
-
+            /*
+             * Let both workers fail a few times, then restart one of the
+             * bookies, so that replication can succeed.
+             */
+            int minFailedAttemptsBeforeRestart = 3;
+            long failedAttemptsDeadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
             int rw1PrevFailedAttemptsCount = 0;
             int rw2PrevFailedAttemptsCount = 0;
-            while (!isBookieRestarted.get()) {
+            while (rw1PrevFailedAttemptsCount < minFailedAttemptsBeforeRestart
+                    || rw2PrevFailedAttemptsCount < minFailedAttemptsBeforeRestart) {
+                assertTrue("Both workers should keep failing while the bookies are down",
+                        System.nanoTime() < failedAttemptsDeadline);
                 /*
                  * since all the bookies containing the ledger entries are down
                  * replication wouldnt have succeeded.
@@ -598,6 +595,7 @@ public class TestReplicationWorker extends BookKeeperClusterTestCase {
 
                 Thread.sleep(50);
             }
+            startAndAddBookie(killedBookiesConfig[0]);
 
             /**
              * since one of the killed bookie is restarted, replicationworker
@@ -862,20 +860,19 @@ public class TestReplicationWorker extends BookKeeperClusterTestCase {
 
             ReplicationWorker rw = new ReplicationWorker(baseConf);
             rw.start();
-            for (int i = 0; i < 10; i++) {
-                if (rw.isRunning()) {
-                    break;
-                }
+            try {
+                Awaitility.await().atMost(10, TimeUnit.SECONDS).until(rw::isRunning);
+                assertTrue("Replication worker should be running", rw.isRunning());
+
+                stopZKCluster();
+                // ZK is down for shorter period than reconnect timeout
                 Thread.sleep(1000);
+                startZKCluster();
+
+                assertTrue("Replication worker should not shutdown", rw.isRunning());
+            } finally {
+                rw.shutdown();
             }
-            assertTrue("Replication worker should be running", rw.isRunning());
-
-            stopZKCluster();
-            // ZK is down for shorter period than reconnect timeout
-            Thread.sleep(1000);
-            startZKCluster();
-
-            assertTrue("Replication worker should not shutdown", rw.isRunning());
         }
     }
 
@@ -920,12 +917,7 @@ public class TestReplicationWorker extends BookKeeperClusterTestCase {
         auditor.submitAuditTask();
         rw.run();
 
-        for (int i = 0; i < 10; i++) {
-            if (!rw.isRunning() && !auditor.isRunning()) {
-                break;
-            }
-            Thread.sleep(1000);
-        }
+        Awaitility.await().atMost(10, TimeUnit.SECONDS).until(() -> !rw.isRunning() && !auditor.isRunning());
         assertFalse("Replication worker should NOT be running", rw.isRunning());
         assertFalse("Auditor should NOT be running", auditor.isRunning());
     }
@@ -1086,6 +1078,9 @@ public class TestReplicationWorker extends BookKeeperClusterTestCase {
         servConf.setAuditorPeriodicPlacementPolicyCheckInterval(1000);
         servConf.setRepairedPlacementPolicyNotAdheringBookieEnable(true);
 
+        ZooKeeper zk = getZk((PulsarMetadataClientDriver) bkc.getMetadataClientDriver());
+        String urLedgerPath = "/ledgers/underreplication/ledgers/0000/0000/0000/0000/urL0000000000";
+
         MutableObject<Auditor> auditorRef = new MutableObject<Auditor>();
         try {
             TestStatsLogger statsLogger = startAuditorAndWaitForPlacementPolicyCheck(servConf, auditorRef);
@@ -1097,6 +1092,13 @@ public class TestReplicationWorker extends BookKeeperClusterTestCase {
                     .getGauge(ReplicationStats.NUM_LEDGERS_SOFTLY_ADHERING_TO_PLACEMENT_POLICY);
             assertEquals("NUM_LEDGERS_SOFTLY_ADHERING_TO_PLACEMENT_POLICY guage value",
                     0, ledgersSoftlyAdheringToPlacementPolicyGuage.getSample());
+            /*
+             * placementPolicyCheck marks the ledger underreplicated with a fire-and-forget async write which
+             * it doesn't await before recording its stats, so the znode isn't necessarily there yet once the
+             * check reports success. Poll for it, and do so while the auditor is still up so that the wait
+             * doesn't race auditor shutdown and the periodic check can retry a write that failed.
+             */
+            Awaitility.await().untilAsserted(() -> assertNotNull(zk.exists(urLedgerPath, false)));
         } finally {
             Auditor auditor = auditorRef.getValue();
             if (auditor != null) {
@@ -1104,13 +1106,18 @@ public class TestReplicationWorker extends BookKeeperClusterTestCase {
             }
         }
 
-        ZooKeeper zk = getZk((PulsarMetadataClientDriver) bkc.getMetadataClientDriver());
-
-
-        Stat stat = zk.exists("/ledgers/underreplication/ledgers/0000/0000/0000/0000/urL0000000000", false);
-        assertNotNull(stat);
-
-        baseConf.setRepairedPlacementPolicyNotAdheringBookieEnable(true);
+        /*
+         * The worker's first replication attempt necessarily fails, since the only /rack2 bookie is started
+         * afterwards. That failure defers the ledger lock release by
+         * lockReleaseOfFailedLedgerGracePeriod / 2^5, i.e. 9375ms with the default grace period, and the run
+         * loop then backs off for rwRereplicateBackoffMs, i.e. another 5000ms. Both delays would be spent
+         * inside the awaits below, leaving them a few hundred milliseconds of their default 10s timeout, so
+         * shorten them here the way the other ReplicationWorker tests in this class do.
+         */
+        ServerConfiguration rwConf = new ServerConfiguration(baseConf);
+        rwConf.setRepairedPlacementPolicyNotAdheringBookieEnable(true);
+        rwConf.setLockReleaseOfFailedLedgerGracePeriod("64");
+        rwConf.setRwRereplicateBackoffMs(100);
         BookKeeper bookKeeper = new PulsarBookKeeperTestClient(baseClientConf) {
             @Override
             protected EnsemblePlacementPolicy initializeEnsemblePlacementPolicy(ClientConfiguration conf,
@@ -1133,7 +1140,7 @@ public class TestReplicationWorker extends BookKeeperClusterTestCase {
         };
         TestStatsProvider statsProvider = new TestStatsProvider();
         TestStatsLogger statsLogger = statsProvider.getStatsLogger(REPLICATION_SCOPE);
-        ReplicationWorker rw = new ReplicationWorker(baseConf, bookKeeper, false, statsLogger);
+        ReplicationWorker rw = new ReplicationWorker(rwConf, bookKeeper, false, statsLogger);
 
         if (checkReplicationStats != null) {
             checkReplicationStats.accept(true, rw);
@@ -1155,7 +1162,7 @@ public class TestReplicationWorker extends BookKeeperClusterTestCase {
         });
 
         Awaitility.await().untilAsserted(() -> {
-            Stat stat1 = zk.exists("/ledgers/underreplication/ledgers/0000/0000/0000/0000/urL0000000000", false);
+            Stat stat1 = zk.exists(urLedgerPath, false);
             assertNull(stat1);
         });
 
@@ -1168,7 +1175,6 @@ public class TestReplicationWorker extends BookKeeperClusterTestCase {
         if (checkReplicationStats == null) {
             rw.shutdown();
         }
-        baseConf.setRepairedPlacementPolicyNotAdheringBookieEnable(false);
         bookKeeper.close();
     }
 

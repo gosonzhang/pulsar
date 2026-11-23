@@ -21,39 +21,19 @@ val pulsarVersion = project.version.toString()
 val dockerOrganization = providers.gradleProperty("docker.organization").getOrElse("apachepulsar")
 val dockerTag = providers.gradleProperty("docker.tag").getOrElse("latest")
 val dockerPlatforms = providers.gradleProperty("docker.platforms").getOrElse("")
-val golangImage = providers.gradleProperty("docker.golang.image").getOrElse("golang:1.24-alpine")
+val dockerInstallAsyncProfiler = providers.gradleProperty("docker.install.asyncprofiler").getOrElse("false")
+val golangImage = providers.gradleProperty("docker.golang.image").getOrElse("golang:1.25-alpine")
 
-// Ensure the parent project is configured before resolving cross-project task references.
-// Required for --configure-on-demand: the Kotlin DSL needs parent ClassLoaderScopes to be locked.
-evaluationDependsOn(":docker")
-
-// Resolvable configurations for cross-project artifact dependencies.
-// Using configurations instead of direct task references (project().tasks.named())
-// ensures compatibility with Gradle's configure-on-demand feature.
-val testFunctionsJar by configurations.creating {
-    isCanBeResolved = true
-    isCanBeConsumed = false
-    isTransitive = false
-}
-val testPluginsJar by configurations.creating {
-    isCanBeResolved = true
-    isCanBeConsumed = false
-    isTransitive = false
-}
-val buildtoolsJar by configurations.creating {
-    isCanBeResolved = true
-    isCanBeConsumed = false
-    isTransitive = false
-}
-
-dependencies {
-    testFunctionsJar(project(":tests:java-test-functions"))
-    testPluginsJar(project(":tests:java-test-plugins"))
-    buildtoolsJar(project(":buildtools"))
-}
+// The archives of other projects that go into the image, see ProjectArtifacts.kt
+val testFunctionsJar = projectJars("testFunctionsJar", ":tests:java-test-functions").files
+val testPluginsJar = projectJars("testPluginsJar", ":tests:java-test-plugins").files
+val buildtoolsJar = projectJars("buildtoolsJar", ":buildtools").files
+// The filesystem offloader NAR is excluded from the base image; layer it back in here as an overlay
+// so the filesystem offload integration tests can run against this image.
+val offloaderNar = projectNars("offloaderNar", ":tiered-storage:tiered-storage-file-system").files
 
 // Prepare the build context in target/ (to match Dockerfile COPY paths)
-val prepareBuildContext by tasks.registering(Sync::class) {
+val prepareBuildContext = tasks.register<Sync>("prepareBuildContext") {
     // Copy pulsar-function-go source
     from("${rootDir}/pulsar-function-go") {
         into("pulsar-function-go")
@@ -80,25 +60,33 @@ val prepareBuildContext by tasks.registering(Sync::class) {
         rename { "buildtools.jar" }
     }
 
+    // Copy the filesystem offloader NAR (excluded from the base image)
+    from(offloaderNar) {
+        into("offloaders")
+    }
+
     into("${projectDir}/target")
 }
 
-val dockerBuild by tasks.registering(Exec::class) {
+val dockerBuild = tasks.register<Exec>("dockerBuild") {
     group = "docker"
     description = "Build the pulsar-test-latest-version Docker image"
 
-    dependsOn(":docker:pulsar-docker-image:dockerBuild", prepareBuildContext)
-
     val imageName = "${dockerOrganization}/pulsar-test-latest-version:${dockerTag}"
+    val imageIdFile = layout.buildDirectory.file("docker/dockerBuild.iid").get().asFile
     val pulsarImage = "${dockerOrganization}/pulsar:${dockerTag}"
+    val asyncProfilerVersion = libs.versions.async.profiler.get()
 
     workingDir = projectDir
 
     val args = mutableListOf(
         "docker", "build",
         "-t", imageName,
+        "--iidfile", imageIdFile.absolutePath,
         "--build-arg", "PULSAR_IMAGE=${pulsarImage}",
         "--build-arg", "GOLANG_IMAGE=${golangImage}",
+        "--build-arg", "INSTALL_ASYNC_PROFILER=${dockerInstallAsyncProfiler}",
+        "--build-arg", "ASYNC_PROFILER_VERSION=${asyncProfilerVersion}"
     )
 
     if (dockerPlatforms.isNotEmpty()) {
@@ -108,4 +96,20 @@ val dockerBuild by tasks.registering(Exec::class) {
     args.add(".")
 
     commandLine(args)
+
+    // Rebuild the image only when what goes into it changes, see dockerImageOutput
+    inputs.file("Dockerfile")
+    inputs.dir("conf")
+    inputs.dir("go-examples")
+    inputs.dir("python-examples")
+    inputs.dir("scripts")
+    inputs.files(prepareBuildContext)
+    // The ID of the Pulsar image, which builds it first, so that a new base image rebuilds this one
+    inputs.files(sharedBuildArtifact(":docker:pulsar-docker-image", "docker-image:pulsar"))
+        .withPropertyName("pulsarImageId")
+    inputs.property("dockerBuildArgs", args)
+    dockerImageOutput(imageName, imageIdFile)
 }
+// The image ID, for the integration tests that run on this image: see SharedBuildArtifacts.kt
+shareBuildArtifact("docker-image:pulsar-test-latest-version", layout.buildDirectory.file("docker/dockerBuild.iid"),
+    dockerBuild)

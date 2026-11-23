@@ -18,19 +18,29 @@
  */
 
 plugins {
-    id("pulsar.java-conventions")
+    id("pulsar.public-java-library-conventions")
 }
 
 dependencies {
-    implementation(project(":pulsar-client-api-v5"))
+    api(project(":pulsar-client-api-v5"))
+    implementation(project(":pulsar-tls-factory-api"))
+    implementation(project(":pulsar-http-client-api"))
     implementation(project(":pulsar-client-original"))
     implementation(project(":pulsar-common"))
     implementation(libs.slf4j.api)
     implementation(libs.slog)
     implementation(libs.opentelemetry.api)
-    implementation(libs.protobuf.java)
+    // protobuf-java is only needed at compile time (for the Schema.protobuf() signature, which
+    // references com.google.protobuf.Message). Keeping it compileOnly — as pulsar-client and
+    // pulsar-client-api-v5 do — avoids dragging protobuf into every distribution that bundles the
+    // V5 client; callers that actually use protobuf schemas bring protobuf-java themselves.
+    compileOnly(libs.protobuf.java)
     implementation(libs.netty.handler)
     implementation(libs.jackson.annotations)
+    // pulsar-client's configuration-data classes carry runtime-retained @Schema annotations, so javac needs
+    // the OpenAPI annotation types on the compile classpath to read their class files without warning.
+    compileOnly(libs.swagger.annotations)
+    testCompileOnly(libs.swagger.annotations)
     compileOnly(libs.lombok)
     annotationProcessor(libs.lombok)
     testImplementation(libs.testng)

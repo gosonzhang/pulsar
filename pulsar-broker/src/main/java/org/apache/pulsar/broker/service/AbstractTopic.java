@@ -44,11 +44,13 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.Function;
 import java.util.function.ToLongFunction;
 import lombok.Getter;
 import lombok.Setter;
@@ -59,6 +61,7 @@ import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.pulsar.broker.PulsarService;
 import org.apache.pulsar.broker.ServiceConfiguration;
+import org.apache.pulsar.broker.loadbalance.extensions.ExtensibleLoadManagerImpl;
 import org.apache.pulsar.broker.resourcegroup.ResourceGroup;
 import org.apache.pulsar.broker.resourcegroup.ResourceGroupPublishLimiter;
 import org.apache.pulsar.broker.resources.NamespaceResources;
@@ -67,12 +70,15 @@ import org.apache.pulsar.broker.service.BrokerServiceException.ProducerBusyExcep
 import org.apache.pulsar.broker.service.BrokerServiceException.ProducerFencedException;
 import org.apache.pulsar.broker.service.BrokerServiceException.TopicMigratedException;
 import org.apache.pulsar.broker.service.BrokerServiceException.TopicTerminatedException;
+import org.apache.pulsar.broker.service.persistent.PersistentReplicator;
 import org.apache.pulsar.broker.service.persistent.PersistentTopic;
 import org.apache.pulsar.broker.service.plugin.EntryFilter;
+import org.apache.pulsar.broker.service.scalable.SegmentTopicPolicies;
 import org.apache.pulsar.broker.service.schema.SchemaRegistryService;
 import org.apache.pulsar.broker.service.schema.exceptions.IncompatibleSchemaException;
 import org.apache.pulsar.broker.service.schema.exceptions.SchemaException;
 import org.apache.pulsar.common.api.proto.CommandSubscribe.SubType;
+import org.apache.pulsar.common.api.proto.ProducerAccessMode;
 import org.apache.pulsar.common.naming.NamespaceName;
 import org.apache.pulsar.common.naming.TopicName;
 import org.apache.pulsar.common.partition.PartitionedTopicMetadata;
@@ -116,6 +122,10 @@ public abstract class AbstractTopic implements Topic, TopicPolicyListener {
     protected final ConcurrentHashMap<String, Producer> producers;
 
     protected final BrokerService brokerService;
+
+    // Wraps this topic as a TopicPolicyListener so topic-policy updates received while the initial policy is still
+    // loading are buffered and applied in order once initTopicPolicy() completes initialization.
+    protected final TopicPolicyListenerWrapper topicPolicyListener;
 
     // Prefix for replication cursors
     protected final String replicatorPrefix;
@@ -167,9 +177,8 @@ public abstract class AbstractTopic implements Topic, TopicPolicyListener {
     protected volatile int userCreatedProducerCount = 0;
 
     protected volatile Optional<Long> topicEpoch = Optional.empty();
-    private volatile boolean hasExclusiveProducer;
-    // pointer to the exclusive producer
-    private volatile String exclusiveProducerName;
+    // the exclusive producer, or null if there is none; only written with the write lock held
+    private volatile Producer exclusiveProducer;
 
     private final Queue<Pair<Producer, CompletableFuture<Optional<Long>>>> waitingExclusiveProducers =
             new ConcurrentLinkedQueue<>();
@@ -178,7 +187,17 @@ public abstract class AbstractTopic implements Topic, TopicPolicyListener {
             AtomicLongFieldUpdater.newUpdater(AbstractTopic.class, "usageCount");
     private volatile long usageCount = 0;
 
-    private Map<String/*subscription*/, SubscriptionPolicies> subscriptionPolicies = Collections.emptyMap();
+    // Effective per-subscription policies, merged from the local and global topic policies with local precedence.
+    // Unlike the PolicyHierarchyValue-backed fields, subscriptionPolicies is a plain map. It is kept as the merge of
+    // the two scopes below (rather than assigned directly) because the local-before-global initialization order
+    // (see TopicPolicyListenerWrapper) would otherwise let the global map -- empty by default in TopicPolicies --
+    // overwrite and clear the local per-subscription policies that were applied just before it.
+    // subscriptionPolicies is volatile because it is read on dispatch threads (getSubscriptionDispatchRate) while it
+    // is updated on the policy-update thread. localSubscriptionPolicies/globalSubscriptionPolicies are only ever read
+    // and written on the (single) policy-update thread, so they don't need to be volatile.
+    private volatile Map<String/*subscription*/, SubscriptionPolicies> subscriptionPolicies = Collections.emptyMap();
+    private Map<String/*subscription*/, SubscriptionPolicies> localSubscriptionPolicies = Collections.emptyMap();
+    private Map<String/*subscription*/, SubscriptionPolicies> globalSubscriptionPolicies = Collections.emptyMap();
 
     protected final LongAdder msgOutFromRemovedSubscriptions = new LongAdder();
     protected final LongAdder bytesOutFromRemovedSubscriptions = new LongAdder();
@@ -189,11 +208,21 @@ public abstract class AbstractTopic implements Topic, TopicPolicyListener {
     protected final Clock clock;
 
     protected Set<String> additionalSystemCursorNames = new TreeSet<>();
+    private final ExecutorService topicPoliciesNotifyThread;
+    // The topic whose policies this topic reads: the partitioned topic for a partition, the parent topic:// for
+    // a scalable topic segment, otherwise the topic itself.
+    private final TopicName topicPoliciesName;
 
     public AbstractTopic(String topic, BrokerService brokerService) {
         this.topic = topic;
+        this.topicPolicyListener = new TopicPolicyListenerWrapper(this, topic);
         this.log = LOG.with().attr("topic", topic).build();
         this.namespace = TopicName.get(topic).getNamespaceObject();
+        // Pin the per-topic policies-notify thread once. BrokerService#getTopicPoliciesNotifyThread centralizes
+        // the topic-to-thread mapping so it stays consistent with SystemTopicBasedTopicPoliciesService. In unit
+        // tests that construct topics with a mock BrokerService this returns null (the thread is unused there).
+        this.topicPoliciesName = SegmentTopicPolicies.topicPoliciesName(TopicName.get(topic));
+        this.topicPoliciesNotifyThread = brokerService.getTopicPoliciesNotifyThread(topicPoliciesName);
         this.clock = brokerService.getClock();
         this.brokerService = brokerService;
         this.producers = new ConcurrentHashMap<>();
@@ -312,9 +341,34 @@ public abstract class AbstractTopic implements Topic, TopicPolicyListener {
         topicPolicies.getEntryFilters().updateTopicValue(data.getEntryFilters(), isGlobalPolicies);
         topicPolicies.getDispatcherPauseOnAckStatePersistentEnabled()
                 .updateTopicValue(data.getDispatcherPauseOnAckStatePersistentEnabled(), isGlobalPolicies);
-        this.subscriptionPolicies = data.getSubscriptionPolicies();
+
+        // Merge instead of assigning directly: keep the local and global per-subscription policies separately and
+        // recompute the effective map with local precedence, so applying the (default-empty) global map does not
+        // clear the local per-subscription policies during the local-before-global initialization.
+        if (isGlobalPolicies) {
+            globalSubscriptionPolicies = data.getSubscriptionPolicies();
+        } else {
+            localSubscriptionPolicies = data.getSubscriptionPolicies();
+        }
+        subscriptionPolicies = mergeSubscriptionPolicies(globalSubscriptionPolicies, localSubscriptionPolicies);
 
         updateEntryFilters();
+    }
+
+    // Merges the global and local per-subscription policies with local precedence: a subscription present in the
+    // local policies keeps its local value; otherwise the global value (if any) is used.
+    private static Map<String, SubscriptionPolicies> mergeSubscriptionPolicies(
+            Map<String, SubscriptionPolicies> globalSubscriptionPolicies,
+            Map<String, SubscriptionPolicies> localSubscriptionPolicies) {
+        if (globalSubscriptionPolicies.isEmpty()) {
+            return localSubscriptionPolicies;
+        }
+        if (localSubscriptionPolicies.isEmpty()) {
+            return globalSubscriptionPolicies;
+        }
+        Map<String, SubscriptionPolicies> merged = new HashMap<>(globalSubscriptionPolicies);
+        merged.putAll(localSubscriptionPolicies);
+        return merged;
     }
 
     protected void updateTopicPolicyByNamespacePolicy(Policies namespacePolicies) {
@@ -431,11 +485,7 @@ public abstract class AbstractTopic implements Topic, TopicPolicyListener {
 
     private void updateTopicPolicyByBrokerConfig() {
         ServiceConfiguration config = brokerService.pulsar().getConfiguration();
-        topicPolicies.getInactiveTopicPolicies().updateBrokerValue(new InactiveTopicPolicies(
-                config.getBrokerDeleteInactiveTopicsMode(),
-                config.getBrokerDeleteInactiveTopicsMaxInactiveDurationSeconds(),
-                config.isBrokerDeleteInactiveTopicsEnabled()));
-
+        updateBrokerInactiveTopicPolicies();
         updateBrokerSubscriptionTypesEnabled();
         topicPolicies.getMaxSubscriptionsPerTopic().updateBrokerValue(config.getMaxSubscriptionsPerTopic());
         topicPolicies.getMaxProducersPerTopic().updateBrokerValue(config.getMaxProducersPerTopic());
@@ -557,14 +607,68 @@ public abstract class AbstractTopic implements Topic, TopicPolicyListener {
                 && maxProducers <= USER_CREATED_PRODUCER_COUNTER_UPDATER.get(this);
     }
 
-    protected void registerTopicPolicyListener() {
-        brokerService.getPulsar().getTopicPoliciesService()
-                .registerListenerAsync(TopicName.getPartitionedTopicName(topic), this);
+    @VisibleForTesting
+    public TopicName getTopicPoliciesName() {
+        return topicPoliciesName;
+    }
+
+    protected TopicPolicyListener getTopicPolicyListener() {
+        return topicPolicyListener;
     }
 
     protected void unregisterTopicPolicyListener() {
         brokerService.getPulsar().getTopicPoliciesService()
-                .unregisterListener(TopicName.getPartitionedTopicName(topic), this);
+                .unregisterListener(topicPoliciesName, getTopicPolicyListener());
+    }
+
+    /**
+     * Registers the topic-policy listener and applies the topic's initial policies (global and local) to this topic.
+     * Shared by {@link org.apache.pulsar.broker.service.persistent.PersistentTopic} and
+     * {@link org.apache.pulsar.broker.service.nonpersistent.NonPersistentTopic} so both load their own policies on
+     * topic load, which removes the need to broadcast every topic's policy when a namespace's policy cache finishes
+     * loading (see {@code topicPolicyListenerReplayEnabled}).
+     *
+     * <p>This method is invoked once during topic initialization; the listener wrapper is one-shot for a topic
+     * instance. Whatever the outcome, the wrapper's initialization is always completed afterwards, so it never stays
+     * in the buffering phase (dropping updates) even if policy loading fails.
+     */
+    protected CompletableFuture<Void> initTopicPolicy() {
+        final var topicPoliciesService = brokerService.getPulsar().getTopicPoliciesService();
+
+        CompletableFuture<Void> initTopicPolicyFuture =
+                topicPoliciesService.registerListenerAsync(topicPoliciesName, topicPolicyListener)
+                        .thenCompose(registered -> {
+                            if (!registered) {
+                                return CompletableFuture.completedFuture(null);
+                            }
+                            if (ExtensibleLoadManagerImpl.isInternalTopic(topic)) {
+                                // Internal topics don't load topic-level policies
+                                return CompletableFuture.completedFuture(null);
+                            }
+                            // future for fetching global topic policies
+                            CompletableFuture<Optional<TopicPolicies>> globalPoliciesFuture =
+                                    topicPoliciesService.getTopicPoliciesAsync(topicPoliciesName,
+                                            TopicPoliciesService.GetType.GLOBAL_ONLY);
+                            // future for fetching local topic policies
+                            CompletableFuture<Optional<TopicPolicies>> localPoliciesFuture =
+                                    topicPoliciesService.getTopicPoliciesAsync(topicPoliciesName,
+                                            TopicPoliciesService.GetType.LOCAL_ONLY);
+                            return globalPoliciesFuture.thenCombine(localPoliciesFuture, (global, local) -> {
+                                // finally update the topic policies with the latest value or loaded value
+                                return CompletableFuture.runAsync(() ->
+                                                topicPolicyListener.completeInitialization(global.orElse(null),
+                                                        local.orElse(null)),
+                                        getPoliciesNotifyThread());
+                            }).thenCompose(Function.identity());
+                        });
+        // Whatever the outcome -- success, failure, or the listener not being registered -- make sure the wrapper
+        // leaves the initialization (buffering) phase, so it forwards any buffered value plus all future live updates
+        // instead of dropping them. This is a no-op when the loaded policies were already applied above. Return the
+        // whenComplete stage (not initTopicPolicyFuture) so the returned future completes only after this has run, and
+        // whenComplete's pass-through semantics carry the original success or failure to the caller's initialize().
+        return initTopicPolicyFuture.whenCompleteAsync((v, ex) -> {
+            topicPolicyListener.completeInitializationUnlessAlreadyCompleted();
+        }, getPoliciesNotifyThread());
     }
 
     protected boolean isSameAddressProducersExceeded(Producer producer) {
@@ -665,6 +769,19 @@ public abstract class AbstractTopic implements Topic, TopicPolicyListener {
         return null;
     }
 
+    protected boolean hasProducersActive() {
+        return !producers.isEmpty();
+    }
+
+    protected boolean hasActiveReplicators() {
+        for (Replicator replicator : getReplicators().values()) {
+            if (replicator.isConnected()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     protected boolean hasLocalProducers() {
         if (producers.isEmpty()) {
             return false;
@@ -675,6 +792,19 @@ public abstract class AbstractTopic implements Topic, TopicPolicyListener {
             }
         }
         return false;
+    }
+
+    public void disconnectReplicatorsIfNoTrafficAndBacklog() {
+        for (Replicator replicator : getReplicators().values()) {
+            if (replicator instanceof PersistentReplicator persistentReplicator) {
+                persistentReplicator.disconnectIfNoTrafficAndBacklog();
+            }
+        }
+        for (Replicator replicator : getShadowReplicators().values()) {
+            if (replicator instanceof PersistentReplicator persistentReplicator) {
+                persistentReplicator.disconnectIfNoTrafficAndBacklog();
+            }
+        }
     }
 
     @Override
@@ -799,31 +929,19 @@ public abstract class AbstractTopic implements Topic, TopicPolicyListener {
         return brokerService.checkTopicNsOwnership(getName())
                 .thenCompose(__ ->
                         incrementTopicEpochIfNeeded(producer, producerQueuedFuture))
-                .thenCompose(producerEpoch -> {
-                    lock.writeLock().lock();
-                    try {
-                        checkTopicFenced();
-                        if (isMigrated()) {
-                            log.warn("Attempting to add producer to a migrated topic");
-                            throw new TopicMigratedException("Topic was already migrated");
-                        } else if (isTerminated()) {
-                            log.warn("Attempting to add producer to a terminated topic");
-                            throw new TopicTerminatedException("Topic was already terminated");
-                        }
-                        return internalAddProducer(producer).thenApply(ignore -> {
+                .thenCompose(producerEpoch ->
+                        internalAddProducer(producer).whenComplete((ignore, ex) -> {
+                            if (ex != null) {
+                                handleExclusiveProducerAddFailed(producer);
+                            }
+                        }).thenApply(ignore -> {
                             USAGE_COUNT_UPDATER.incrementAndGet(this);
                             log.debug()
                                     .attr("producerName", producer.getProducerName())
                                     .attr("usageCount", USAGE_COUNT_UPDATER.get(this))
                                     .log("Added producer");
                             return producerEpoch;
-                        });
-                    } catch (BrokerServiceException e) {
-                        return FutureUtil.failedFuture(e);
-                    } finally {
-                        lock.writeLock().unlock();
-                    }
-                });
+                        }));
     }
 
     protected CompletableFuture<Optional<Long>> incrementTopicEpochIfNeeded(Producer producer,
@@ -832,26 +950,26 @@ public abstract class AbstractTopic implements Topic, TopicPolicyListener {
         try {
             switch (producer.getAccessMode()) {
             case Shared:
-                if (hasExclusiveProducer || !waitingExclusiveProducers.isEmpty()) {
+                if (hasExclusiveProducer() || !waitingExclusiveProducers.isEmpty()) {
                     return FutureUtil.failedFuture(
                             new ProducerBusyException(
-                                    "Topic has an existing exclusive producer: " + exclusiveProducerName));
+                                    "Topic has an existing exclusive producer: " + getExclusiveProducerName()));
                 } else {
                     // Normal producer getting added, we don't need a new epoch
                     return CompletableFuture.completedFuture(topicEpoch);
                 }
 
             case Exclusive:
-                if (hasExclusiveProducer || !waitingExclusiveProducers.isEmpty()) {
+                if (hasExclusiveProducer() || !waitingExclusiveProducers.isEmpty()) {
                     return FutureUtil.failedFuture(
                             new ProducerFencedException(
-                                    "Topic has an existing exclusive producer: " + exclusiveProducerName));
+                                    "Topic has an existing exclusive producer: " + getExclusiveProducerName()));
                 } else if (!producers.isEmpty()) {
                     return FutureUtil.failedFuture(new ProducerFencedException("Topic has existing shared producers"));
                 }
                 return handleTopicEpochForExclusiveProducer(producer);
             case ExclusiveWithFencing:
-                if (hasExclusiveProducer || !producers.isEmpty()) {
+                if (hasExclusiveProducer() || !producers.isEmpty()) {
                     // clear all waiting producers
                     // otherwise closing any producer will trigger the promotion
                     // of the next pending producer
@@ -873,7 +991,7 @@ public abstract class AbstractTopic implements Topic, TopicPolicyListener {
                 }
                 return handleTopicEpochForExclusiveProducer(producer);
             case WaitForExclusive: {
-                if (hasExclusiveProducer || !producers.isEmpty()) {
+                if (hasExclusiveProducer() || !producers.isEmpty()) {
                     CompletableFuture<Optional<Long>> future = new CompletableFuture<>();
                     log.info()
                             .attr("producer", producer)
@@ -910,8 +1028,7 @@ public abstract class AbstractTopic implements Topic, TopicPolicyListener {
                             topicEpoch.get(), producer.getTopicEpoch().get())));
         }
         // There are currently no existing producers
-        hasExclusiveProducer = true;
-        exclusiveProducerName = producer.getProducerName();
+        exclusiveProducer = producer;
 
         CompletableFuture<Long> future;
         if (producer.getTopicEpoch().isPresent()) {
@@ -920,8 +1037,7 @@ public abstract class AbstractTopic implements Topic, TopicPolicyListener {
             future = incrementTopicEpoch(topicEpoch);
         }
         future.exceptionally(ex -> {
-            hasExclusiveProducer = false;
-            exclusiveProducerName = null;
+            releaseExclusiveProducer(producer);
             return null;
         });
 
@@ -1000,23 +1116,45 @@ public abstract class AbstractTopic implements Topic, TopicPolicyListener {
     }
 
     protected CompletableFuture<Void> internalAddProducer(Producer producer) {
-        if (isSameAddressProducersExceeded(producer)) {
-            log.warn("Attempting to add producer to topic which reached max same address producers limit");
-            return CompletableFuture.failedFuture(new BrokerServiceException.ProducerBusyException(
-                    "Topic '" + topic + "' reached max same address producers limit"));
-        }
+        // Check the topic state under the lock on every attempt, including the retry after the old producer's
+        // connection liveness check, since the topic may have been closed while that check was in progress.
+        lock.writeLock().lock();
+        try {
+            checkTopicFenced();
+            if (isMigrated()) {
+                log.warn("Attempting to add producer to a migrated topic");
+                throw new TopicMigratedException("Topic was already migrated");
+            } else if (isTerminated()) {
+                log.warn("Attempting to add producer to a terminated topic");
+                throw new TopicTerminatedException("Topic was already terminated");
+            }
 
-        log.debug()
-                .attr("producerName", producer.getProducerName())
-                .log("Got request to create producer");
+            if (producer.getAccessMode() != ProducerAccessMode.Shared && exclusiveProducer != producer) {
+                return FutureUtil.failedFuture(new ProducerFencedException("Fenced out"));
+            }
 
-        Producer existProducer = producers.putIfAbsent(producer.getProducerName(), producer);
-        if (existProducer != null) {
-            return tryOverwriteOldProducer(existProducer, producer);
-        } else if (!producer.isRemote()) {
-            USER_CREATED_PRODUCER_COUNTER_UPDATER.incrementAndGet(this);
+            if (isSameAddressProducersExceeded(producer)) {
+                log.warn("Attempting to add producer to topic which reached max same address producers limit");
+                return CompletableFuture.failedFuture(new BrokerServiceException.ProducerBusyException(
+                        "Topic '" + topic + "' reached max same address producers limit"));
+            }
+
+            log.debug()
+                    .attr("producerName", producer.getProducerName())
+                    .log("Got request to create producer");
+
+            Producer existProducer = producers.putIfAbsent(producer.getProducerName(), producer);
+            if (existProducer != null) {
+                return tryOverwriteOldProducer(existProducer, producer);
+            } else if (!producer.isRemote()) {
+                USER_CREATED_PRODUCER_COUNTER_UPDATER.incrementAndGet(this);
+            }
+            return CompletableFuture.completedFuture(null);
+        } catch (BrokerServiceException e) {
+            return FutureUtil.failedFuture(e);
+        } finally {
+            lock.writeLock().unlock();
         }
-        return CompletableFuture.completedFuture(null);
     }
 
     private CompletableFuture<Void> tryOverwriteOldProducer(Producer oldProducer, Producer newProducer) {
@@ -1081,45 +1219,77 @@ public abstract class AbstractTopic implements Topic, TopicPolicyListener {
         // and execute following routine when:
         // 1. If there was an exclusive producer before.
         // 2. If this was the last producer closed and there are waiting exclusive producers
-        if (hasExclusiveProducer || (producers.isEmpty() && !waitingExclusiveProducers.isEmpty())) {
-            lock.writeLock().lock();
-            try {
-                hasExclusiveProducer = false;
-                exclusiveProducerName = null;
-                Pair<Producer, CompletableFuture<Optional<Long>>> nextWaitingProducer =
-                        waitingExclusiveProducers.poll();
-                if (nextWaitingProducer != null) {
-                    Producer nextProducer = nextWaitingProducer.getKey();
-                    CompletableFuture<Optional<Long>> producerFuture = nextWaitingProducer.getValue();
-                    hasExclusiveProducer = true;
-                    exclusiveProducerName = nextProducer.getProducerName();
-
-                    CompletableFuture<Long> future;
-                    if (nextProducer.getTopicEpoch().isPresent()) {
-                        future = setTopicEpoch(nextProducer.getTopicEpoch().get());
-                    } else {
-                        future = incrementTopicEpoch(topicEpoch);
-                    }
-
-                    future.thenAccept(epoch -> {
-                        topicEpoch = Optional.of(epoch);
-                        producerFuture.complete(topicEpoch);
-                    }).exceptionally(ex -> {
-                        hasExclusiveProducer = false;
-                        exclusiveProducerName = null;
-                        producerFuture.completeExceptionally(ex);
-                        return null;
-                    });
-                }
-            } finally {
-                lock.writeLock().unlock();
-            }
+        if (hasExclusiveProducer() || (producers.isEmpty() && !waitingExclusiveProducers.isEmpty())) {
+            releaseExclusiveProducer(producer);
         }
         log.debug()
                 .attr("producerName", producer.getProducerName())
                 .attr("usageCount", USAGE_COUNT_UPDATER.get(this))
                 .log("Removed producer");
         lastActive = System.nanoTime();
+    }
+
+    private boolean hasExclusiveProducer() {
+        return exclusiveProducer != null;
+    }
+
+    private String getExclusiveProducerName() {
+        Producer producer = exclusiveProducer;
+        return producer != null ? producer.getProducerName() : null;
+    }
+
+    private void releaseExclusiveProducer(Producer producer) {
+        lock.writeLock().lock();
+        try {
+            if (exclusiveProducer == producer) {
+                exclusiveProducer = null;
+            }
+            promoteNextWaitingProducerIfIdle();
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    private void handleExclusiveProducerAddFailed(Producer producer) {
+        lock.writeLock().lock();
+        try {
+            if (exclusiveProducer == producer && producers.get(producer.getProducerName()) != producer) {
+                // This producer will never be removed, so hand over to one that will be, if any
+                exclusiveProducer = producers.values().stream().findFirst().orElse(null);
+                promoteNextWaitingProducerIfIdle();
+            }
+        } finally {
+            lock.writeLock().unlock();
+        }
+    }
+
+    // must be called with the write lock held
+    private void promoteNextWaitingProducerIfIdle() {
+        if (exclusiveProducer != null || !producers.isEmpty()) {
+            return;
+        }
+        Pair<Producer, CompletableFuture<Optional<Long>>> nextWaitingProducer = waitingExclusiveProducers.poll();
+        if (nextWaitingProducer != null) {
+            Producer nextProducer = nextWaitingProducer.getKey();
+            CompletableFuture<Optional<Long>> producerFuture = nextWaitingProducer.getValue();
+            exclusiveProducer = nextProducer;
+
+            CompletableFuture<Long> future;
+            if (nextProducer.getTopicEpoch().isPresent()) {
+                future = setTopicEpoch(nextProducer.getTopicEpoch().get());
+            } else {
+                future = incrementTopicEpoch(topicEpoch);
+            }
+
+            future.thenAccept(epoch -> {
+                topicEpoch = Optional.of(epoch);
+                producerFuture.complete(topicEpoch);
+            }).exceptionally(ex -> {
+                producerFuture.completeExceptionally(ex);
+                releaseExclusiveProducer(nextProducer);
+                return null;
+            });
+        }
     }
 
     public void handleConsumerAdded(String subscriptionName, String consumerName) {
@@ -1258,6 +1428,10 @@ public abstract class AbstractTopic implements Topic, TopicPolicyListener {
         return topicPolicies.getInactiveTopicPolicies().get().isDeleteWhileInactive();
     }
 
+    public boolean isCloseWhileInactive() {
+        return brokerService.pulsar().getConfiguration().isBrokerCloseInactiveTopicsEnabled();
+    }
+
     public boolean deletePartitionedTopicMetadataWhileInactive() {
         return brokerService.pulsar().getConfiguration().isBrokerDeleteInactivePartitionedTopicMetadataEnabled();
     }
@@ -1275,6 +1449,10 @@ public abstract class AbstractTopic implements Topic, TopicPolicyListener {
 
     public CompletableFuture<Void> deleteTopicPolicies() {
         if (TopicName.get(getName()).isPartitioned()) {
+            return CompletableFuture.completedFuture(null);
+        }
+        if (TopicName.get(getName()).isSegment()) {
+            // a segment owns no policies; they belong to its parent topic://
             return CompletableFuture.completedFuture(null);
         }
         return brokerService.pulsar().getTopicPoliciesService().deleteTopicPoliciesAsync(TopicName.get(topic));
@@ -1314,6 +1492,15 @@ public abstract class AbstractTopic implements Topic, TopicPolicyListener {
             log.debug("Disabling publish throttling");
         }
         this.topicPublishRateLimiter.update(publishRate);
+    }
+
+    // brokerDeleteInactiveTopicsEnabled is dynamic and can be updated online.
+    public void updateBrokerInactiveTopicPolicies() {
+        ServiceConfiguration config = brokerService.pulsar().getConfiguration();
+        topicPolicies.getInactiveTopicPolicies().updateBrokerValue(new InactiveTopicPolicies(
+                config.getBrokerDeleteInactiveTopicsMode(),
+                config.getBrokerDeleteInactiveTopicsMaxInactiveDurationSeconds(),
+                config.isBrokerDeleteInactiveTopicsEnabled()));
     }
 
     // subscriptionTypesEnabled is dynamic and can be updated online.
@@ -1365,8 +1552,8 @@ public abstract class AbstractTopic implements Topic, TopicPolicyListener {
             subscribeRateInBroker(brokerService.pulsar().getConfiguration()));
     }
 
-    public Optional<ClusterUrl> getMigratedClusterUrl() {
-        return getMigratedClusterUrl(brokerService.getPulsar(), topic);
+    public CompletableFuture<Optional<ClusterUrl>> getMigratedClusterUrlAsync() {
+        return getMigratedClusterUrlAsync(brokerService.getPulsar(), topic);
     }
 
     public static CompletableFuture<Boolean> isClusterMigrationEnabled(PulsarService pulsar,
@@ -1404,16 +1591,6 @@ public abstract class AbstractTopic implements Topic, TopicPolicyListener {
         return pulsar.getPulsarResources().getLocalPolicies()
                 .getLocalPoliciesAsync(TopicName.get(topic).getNamespaceObject())
                 .thenApply(policies -> policies.isPresent() && policies.get().migrated);
-    }
-
-    public static Optional<ClusterUrl> getMigratedClusterUrl(PulsarService pulsar, String topic) {
-        try {
-            return getMigratedClusterUrlAsync(pulsar, topic)
-                    .get(pulsar.getPulsarResources().getClusterResources().getOperationTimeoutSec(), TimeUnit.SECONDS);
-        } catch (Exception e) {
-            LOG.warn().exception(e).log("Failed to get migration cluster URL");
-        }
-        return Optional.empty();
     }
 
     public boolean isSystemCursor(String sub) {
@@ -1477,5 +1654,9 @@ public abstract class AbstractTopic implements Topic, TopicPolicyListener {
         } else {
             return Collections.emptyMap();
         }
+    }
+
+    protected ExecutorService getPoliciesNotifyThread() {
+        return topicPoliciesNotifyThread;
     }
 }

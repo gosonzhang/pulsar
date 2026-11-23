@@ -35,7 +35,9 @@ import com.google.common.collect.Sets;
 import com.google.common.util.concurrent.MoreExecutors;
 import io.netty.handler.codec.http.HttpRequest;
 import io.netty.handler.codec.http.HttpResponse;
-import io.prometheus.client.CollectorRegistry;
+import io.prometheus.metrics.model.registry.PrometheusRegistry;
+import io.prometheus.metrics.model.snapshots.CounterSnapshot;
+import io.prometheus.metrics.model.snapshots.MetricSnapshot;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.reflect.Field;
@@ -95,7 +97,7 @@ import org.apache.pulsar.common.policies.data.ClusterData;
 import org.apache.pulsar.common.policies.data.PoliciesUtil;
 import org.apache.pulsar.common.policies.data.TenantInfoImpl;
 import org.apache.pulsar.common.util.ObjectMapperFactory;
-import org.apache.pulsar.common.util.SecurityUtility;
+import org.apache.pulsar.common.util.tls.JdkSslContexts;
 import org.apache.pulsar.policies.data.loadbalancer.LocalBrokerData;
 import org.apache.pulsar.policies.data.loadbalancer.NamespaceBundleStats;
 import org.apache.zookeeper.KeeperException;
@@ -243,8 +245,10 @@ public class BrokerServiceLookupTest extends ProducerConsumerBase implements ITe
         // mock: return Broker2 as a Least-loaded broker when leader receives request [3]
         doReturn(true).when(loadManager1).isCentralized();
         SimpleResourceUnit resourceUnit = new SimpleResourceUnit(pulsar2.getBrokerId(), null);
-        doReturn(Optional.of(resourceUnit)).when(loadManager1).getLeastLoaded(any(ServiceUnitId.class));
-        doReturn(Optional.of(resourceUnit)).when(loadManager2).getLeastLoaded(any(ServiceUnitId.class));
+        doReturn(CompletableFuture.completedFuture(Optional.of(resourceUnit))).when(loadManager1)
+                .getLeastLoadedAsync(any(ServiceUnitId.class));
+        doReturn(CompletableFuture.completedFuture(Optional.of(resourceUnit))).when(loadManager2)
+                .getLeastLoadedAsync(any(ServiceUnitId.class));
         loadManagerField.set(pulsar.getNamespaceService(), new AtomicReference<>(loadManager1));
 
         // Disable collecting topic stats during this test, as it deadlocks on access to map BrokerService.topics.
@@ -444,7 +448,8 @@ public class BrokerServiceLookupTest extends ProducerConsumerBase implements ITe
         // mock: return Broker2 as a Least-loaded broker when leader receives request
         doReturn(true).when(loadManager2).isCentralized();
         SimpleResourceUnit resourceUnit = new SimpleResourceUnit(pulsar2.getBrokerId(), null);
-        doReturn(Optional.of(resourceUnit)).when(loadManager2).getLeastLoaded(any(ServiceUnitId.class));
+        doReturn(CompletableFuture.completedFuture(Optional.of(resourceUnit))).when(loadManager2)
+                .getLeastLoadedAsync(any(ServiceUnitId.class));
         loadManagerField.set(pulsar.getNamespaceService(), new AtomicReference<>(loadManager2));
         /**** started broker-2 ****/
 
@@ -608,8 +613,10 @@ public class BrokerServiceLookupTest extends ProducerConsumerBase implements ITe
         doReturn(true).when(loadManager1).isCentralized();
         doReturn(true).when(loadManager2).isCentralized();
         SimpleResourceUnit resourceUnit = new SimpleResourceUnit(pulsar.getBrokerId(), null);
-        doReturn(Optional.of(resourceUnit)).when(loadManager2).getLeastLoaded(any(ServiceUnitId.class));
-        doReturn(Optional.of(resourceUnit)).when(loadManager1).getLeastLoaded(any(ServiceUnitId.class));
+        doReturn(CompletableFuture.completedFuture(Optional.of(resourceUnit))).when(loadManager2)
+                .getLeastLoadedAsync(any(ServiceUnitId.class));
+        doReturn(CompletableFuture.completedFuture(Optional.of(resourceUnit))).when(loadManager1)
+                .getLeastLoadedAsync(any(ServiceUnitId.class));
 
         /**** started broker-2 ****/
 
@@ -620,12 +627,12 @@ public class BrokerServiceLookupTest extends ProducerConsumerBase implements ITe
         final String lookupResourceUrl = "/lookup/v2/topic/persistent/my-property/my-ns/my-topic1";
 
         // set client cert_key file
-        SSLContext sslCtx = SecurityUtility.createSslContext(false, CA_CERT_FILE_PATH,
+        SSLContext sslCtx = JdkSslContexts.createSslContext(false, CA_CERT_FILE_PATH,
                 getTlsFileForClient("admin.cert"), getTlsFileForClient("admin.key-pk8"), "");
         HttpsURLConnection.setDefaultSSLSocketFactory(sslCtx.getSocketFactory());
 
         // hit broker2 url
-        URLConnection con = new URL(pulsar2.getWebServiceAddressTls() + lookupResourceUrl).openConnection();
+        URLConnection con = URI.create(pulsar2.getWebServiceAddressTls() + lookupResourceUrl).toURL().openConnection();
         log.info().attr("orignalUrl", con.getURL()).log("orignal url");
         con.connect();
         log.info().attr("connectedUrl", con.getURL()).log("connected url");
@@ -701,8 +708,10 @@ public class BrokerServiceLookupTest extends ProducerConsumerBase implements ITe
         // mock: return Broker1 as a Least-loaded broker when leader receives request [3]
         doReturn(true).when(loadManager1).isCentralized();
         SimpleResourceUnit resourceUnit = new SimpleResourceUnit(pulsar.getBrokerId(), null);
-        doReturn(Optional.of(resourceUnit)).when(loadManager1).getLeastLoaded(any(ServiceUnitId.class));
-        doReturn(Optional.of(resourceUnit)).when(loadManager2).getLeastLoaded(any(ServiceUnitId.class));
+        doReturn(CompletableFuture.completedFuture(Optional.of(resourceUnit))).when(loadManager1)
+                .getLeastLoadedAsync(any(ServiceUnitId.class));
+        doReturn(CompletableFuture.completedFuture(Optional.of(resourceUnit))).when(loadManager2)
+                .getLeastLoadedAsync(any(ServiceUnitId.class));
         loadManagerField.set(pulsar.getNamespaceService(), new AtomicReference<>(loadManager1));
 
         @Cleanup
@@ -812,8 +821,10 @@ public class BrokerServiceLookupTest extends ProducerConsumerBase implements ITe
             doReturn(true).when(loadManager1).isCentralized();
             SimpleResourceUnit resourceUnit = new SimpleResourceUnit(pulsar.getBrokerId(), null);
             Optional<ResourceUnit> res = Optional.of(resourceUnit);
-            doReturn(res).when(loadManager1).getLeastLoaded(any(ServiceUnitId.class));
-            doReturn(res).when(loadManager2).getLeastLoaded(any(ServiceUnitId.class));
+            doReturn(CompletableFuture.completedFuture(res)).when(loadManager1)
+                    .getLeastLoadedAsync(any(ServiceUnitId.class));
+            doReturn(CompletableFuture.completedFuture(res)).when(loadManager2)
+                    .getLeastLoadedAsync(any(ServiceUnitId.class));
             loadManagerField.set(pulsar.getNamespaceService(), new AtomicReference<>(loadManager1));
 
             @Cleanup
@@ -1022,11 +1033,10 @@ public class BrokerServiceLookupTest extends ProducerConsumerBase implements ITe
         }
         HashSet<String> messagesReceived = new HashSet<>();
         for (Consumer<String> consumer : consumers) {
-            while (true) {
+            // Each consumer has a subscription of its own, which gets every message.
+            for (int i = 0; i < messagesSent.size(); i++) {
                 Message<String> msg = consumer.receive(2, TimeUnit.SECONDS);
-                if (msg == null) {
-                    break;
-                }
+                assertNotNull(msg);
                 messagesReceived.add(msg.getValue());
             }
         }
@@ -1043,11 +1053,18 @@ public class BrokerServiceLookupTest extends ProducerConsumerBase implements ITe
     }
 
     private int calculateLookupRequestCount() throws Exception {
-        int failures = CollectorRegistry.defaultRegistry.getSampleValue("pulsar_broker_lookup_failures_total")
-                .intValue();
-        int answers = CollectorRegistry.defaultRegistry.getSampleValue("pulsar_broker_lookup_answers_total")
-                .intValue();
-        return failures + answers;
+        return counterValue("pulsar_broker_lookup_failures") + counterValue("pulsar_broker_lookup_answers");
+    }
+
+    /** Reads the only unlabeled counter named {@code name} from the Prometheus Java client 1.x default registry. */
+    private static int counterValue(String name) {
+        List<MetricSnapshot> snapshots = new ArrayList<>();
+        PrometheusRegistry.defaultRegistry.scrape(name::equals).forEach(snapshots::add);
+        assertEquals(snapshots.size(), 1, "Counter " + name + " should be registered once");
+        List<CounterSnapshot.CounterDataPointSnapshot> dataPoints =
+                ((CounterSnapshot) snapshots.get(0)).getDataPoints();
+        assertEquals(dataPoints.size(), 1, "Counter " + name + " should have one unlabeled data point");
+        return (int) dataPoints.get(0).getValue();
     }
 
     @Test(timeOut = 10000)
@@ -1117,7 +1134,7 @@ public class BrokerServiceLookupTest extends ProducerConsumerBase implements ITe
         final CompletableFuture<PartitionedTopicMetadata> future = new CompletableFuture<>();
         try {
 
-            String requestUrl = new URL(url, path).toString();
+            String requestUrl = url.toURI().resolve(path).toString();
             BoundRequestBuilder builder = httpClient.prepareGet(requestUrl);
 
             final ListenableFuture<Response> responseFuture = builder.setHeader("Accept", "application/json")

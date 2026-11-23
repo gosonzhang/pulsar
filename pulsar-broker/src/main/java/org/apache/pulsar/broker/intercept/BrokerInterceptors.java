@@ -20,12 +20,13 @@ package org.apache.pulsar.broker.intercept;
 
 import com.google.common.annotations.VisibleForTesting;
 import io.netty.buffer.ByteBuf;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.ServletRequest;
+import jakarta.servlet.ServletResponse;
 import java.io.IOException;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
-import javax.servlet.ServletException;
-import javax.servlet.ServletRequest;
-import javax.servlet.ServletResponse;
 import lombok.CustomLog;
 import org.apache.bookkeeper.mledger.Entry;
 import org.apache.pulsar.broker.PulsarService;
@@ -39,6 +40,7 @@ import org.apache.pulsar.common.api.proto.BaseCommand;
 import org.apache.pulsar.common.api.proto.CommandAck;
 import org.apache.pulsar.common.api.proto.MessageMetadata;
 import org.apache.pulsar.common.intercept.InterceptException;
+import org.apache.pulsar.common.protocol.Commands;
 
 /**
  * A collection of broker interceptor.
@@ -46,10 +48,12 @@ import org.apache.pulsar.common.intercept.InterceptException;
 @CustomLog
 public class BrokerInterceptors implements BrokerInterceptor {
 
-    private final Map<String, BrokerInterceptorWithClassLoader> interceptors;
+    // Interceptors in configured order. An array is used because iterating it does not allocate an iterator,
+    // unlike Map.values(), which matters on the per-message hot paths (onMessagePublish, beforeSendMessage, ...).
+    private final BrokerInterceptorWithClassLoader[] interceptors;
 
     public BrokerInterceptors(Map<String, BrokerInterceptorWithClassLoader> interceptors) {
-        this.interceptors = interceptors;
+        this.interceptors = interceptors.values().toArray(new BrokerInterceptorWithClassLoader[0]);
     }
 
     /**
@@ -94,7 +98,7 @@ public class BrokerInterceptors implements BrokerInterceptor {
         });
 
         if (!orderedInterceptorMap.isEmpty()) {
-            return new BrokerInterceptors(Map.copyOf(orderedInterceptorMap));
+            return new BrokerInterceptors(orderedInterceptorMap);
         } else {
             return null;
         }
@@ -105,7 +109,7 @@ public class BrokerInterceptors implements BrokerInterceptor {
                                  ByteBuf headersAndPayload,
                                  Topic.PublishContext publishContext) {
         if (interceptorsEnabled()) {
-            for (BrokerInterceptorWithClassLoader value : interceptors.values()) {
+            for (BrokerInterceptorWithClassLoader value : interceptors) {
                 value.onMessagePublish(producer, headersAndPayload, publishContext);
             }
         }
@@ -118,7 +122,7 @@ public class BrokerInterceptors implements BrokerInterceptor {
                                   long[] ackSet,
                                   MessageMetadata msgMetadata) {
         if (interceptorsEnabled()) {
-            for (BrokerInterceptorWithClassLoader value : interceptors.values()) {
+            for (BrokerInterceptorWithClassLoader value : interceptors) {
                 value.beforeSendMessage(subscription, entry, ackSet, msgMetadata);
             }
         }
@@ -131,7 +135,7 @@ public class BrokerInterceptors implements BrokerInterceptor {
                                   MessageMetadata msgMetadata,
                                   Consumer consumer) {
         if (interceptorsEnabled()) {
-            for (BrokerInterceptorWithClassLoader value : interceptors.values()) {
+            for (BrokerInterceptorWithClassLoader value : interceptors) {
                 value.beforeSendMessage(subscription, entry, ackSet, msgMetadata, consumer);
             }
         }
@@ -142,7 +146,7 @@ public class BrokerInterceptors implements BrokerInterceptor {
                                  Consumer consumer,
                                  Map<String, String> metadata) {
         if (interceptorsEnabled()) {
-            for (BrokerInterceptorWithClassLoader value : interceptors.values()) {
+            for (BrokerInterceptorWithClassLoader value : interceptors) {
                 value.consumerCreated(
                         cnx,
                         consumer,
@@ -156,7 +160,7 @@ public class BrokerInterceptors implements BrokerInterceptor {
                                Consumer consumer,
                                Map<String, String> metadata) {
         if (interceptorsEnabled()) {
-            for (BrokerInterceptorWithClassLoader value : interceptors.values()) {
+            for (BrokerInterceptorWithClassLoader value : interceptors) {
                 value.consumerClosed(cnx, consumer, metadata);
             }
         }
@@ -166,7 +170,7 @@ public class BrokerInterceptors implements BrokerInterceptor {
     public void producerCreated(ServerCnx cnx, Producer producer,
                                  Map<String, String> metadata){
         if (interceptorsEnabled()) {
-            for (BrokerInterceptorWithClassLoader value : interceptors.values()) {
+            for (BrokerInterceptorWithClassLoader value : interceptors) {
                 value.producerCreated(cnx, producer, metadata);
             }
         }
@@ -177,7 +181,7 @@ public class BrokerInterceptors implements BrokerInterceptor {
                                Producer producer,
                                Map<String, String> metadata) {
         if (interceptorsEnabled()) {
-            for (BrokerInterceptorWithClassLoader value : interceptors.values()) {
+            for (BrokerInterceptorWithClassLoader value : interceptors) {
                 value.producerClosed(cnx, producer, metadata);
             }
         }
@@ -187,7 +191,7 @@ public class BrokerInterceptors implements BrokerInterceptor {
     public void messageProduced(ServerCnx cnx, Producer producer, long startTimeNs, long ledgerId,
                                  long entryId, Topic.PublishContext publishContext) {
         if (interceptorsEnabled()) {
-            for (BrokerInterceptorWithClassLoader value : interceptors.values()) {
+            for (BrokerInterceptorWithClassLoader value : interceptors) {
                 value.messageProduced(cnx, producer, startTimeNs, ledgerId, entryId, publishContext);
             }
         }
@@ -197,7 +201,7 @@ public class BrokerInterceptors implements BrokerInterceptor {
     public  void messageDispatched(ServerCnx cnx, Consumer consumer, long ledgerId,
                                    long entryId, ByteBuf headersAndPayload) {
         if (interceptorsEnabled()) {
-            for (BrokerInterceptorWithClassLoader value : interceptors.values()) {
+            for (BrokerInterceptorWithClassLoader value : interceptors) {
                 value.messageDispatched(cnx, consumer, ledgerId, entryId, headersAndPayload);
             }
         }
@@ -207,7 +211,7 @@ public class BrokerInterceptors implements BrokerInterceptor {
     public void messageAcked(ServerCnx cnx, Consumer consumer,
                               CommandAck ackCmd) {
         if (interceptorsEnabled()) {
-            for (BrokerInterceptorWithClassLoader value : interceptors.values()) {
+            for (BrokerInterceptorWithClassLoader value : interceptors) {
                 value.messageAcked(cnx, consumer, ackCmd);
             }
         }
@@ -216,7 +220,7 @@ public class BrokerInterceptors implements BrokerInterceptor {
     @Override
     public void txnOpened(long tcId, String txnID) {
         if (interceptorsEnabled()) {
-            for (BrokerInterceptorWithClassLoader value : interceptors.values()) {
+            for (BrokerInterceptorWithClassLoader value : interceptors) {
                 value.txnOpened(tcId, txnID);
             }
         }
@@ -225,7 +229,7 @@ public class BrokerInterceptors implements BrokerInterceptor {
     @Override
     public void txnEnded(String txnID, long txnAction) {
         if (interceptorsEnabled()) {
-            for (BrokerInterceptorWithClassLoader value : interceptors.values()) {
+            for (BrokerInterceptorWithClassLoader value : interceptors) {
                 value.txnEnded(txnID, txnAction);
             }
         }
@@ -234,7 +238,7 @@ public class BrokerInterceptors implements BrokerInterceptor {
     @Override
     public void onConnectionCreated(ServerCnx cnx) {
         if (interceptorsEnabled()) {
-            for (BrokerInterceptorWithClassLoader value : interceptors.values()) {
+            for (BrokerInterceptorWithClassLoader value : interceptors) {
                 value.onConnectionCreated(cnx);
             }
         }
@@ -242,21 +246,26 @@ public class BrokerInterceptors implements BrokerInterceptor {
 
     @Override
     public void onPulsarCommand(BaseCommand command, ServerCnx cnx) throws InterceptException {
-        for (BrokerInterceptorWithClassLoader value : interceptors.values()) {
+        if (interceptors.length > 1 && Commands.isThreadLocalCommand(command)) {
+            // A callback can build another command on this thread and overwrite the original command.
+            // Detach it once so subsequent interceptors still observe the original fields.
+            command = new BaseCommand().copyFrom(command);
+        }
+        for (BrokerInterceptorWithClassLoader value : interceptors) {
             value.onPulsarCommand(command, cnx);
         }
     }
 
     @Override
     public void onConnectionClosed(ServerCnx cnx) {
-        for (BrokerInterceptorWithClassLoader value : interceptors.values()) {
+        for (BrokerInterceptorWithClassLoader value : interceptors) {
             value.onConnectionClosed(cnx);
         }
     }
 
     @Override
     public void onWebserviceRequest(ServletRequest request) throws IOException, ServletException, InterceptException {
-        for (BrokerInterceptorWithClassLoader value : interceptors.values()) {
+        for (BrokerInterceptorWithClassLoader value : interceptors) {
             value.onWebserviceRequest(request);
         }
     }
@@ -264,29 +273,31 @@ public class BrokerInterceptors implements BrokerInterceptor {
     @Override
     public void onWebserviceResponse(ServletRequest request, ServletResponse response)
             throws IOException, ServletException {
-        for (BrokerInterceptorWithClassLoader value : interceptors.values()) {
+        for (BrokerInterceptorWithClassLoader value : interceptors) {
             value.onWebserviceResponse(request, response);
         }
     }
 
     @Override
     public void initialize(PulsarService pulsarService) throws Exception {
-        for (BrokerInterceptorWithClassLoader v : interceptors.values()) {
+        for (BrokerInterceptorWithClassLoader v : interceptors) {
             v.initialize(pulsarService);
         }
     }
 
     @Override
     public void close() {
-        interceptors.values().forEach(BrokerInterceptorWithClassLoader::close);
+        for (BrokerInterceptorWithClassLoader value : interceptors) {
+            value.close();
+        }
     }
 
     private boolean interceptorsEnabled() {
-        return interceptors != null && !interceptors.isEmpty();
+        return interceptors.length > 0;
     }
 
     @VisibleForTesting
-    public Map<String, BrokerInterceptorWithClassLoader> getInterceptors() {
-        return interceptors;
+    public List<BrokerInterceptorWithClassLoader> getInterceptors() {
+        return List.of(interceptors);
     }
 }

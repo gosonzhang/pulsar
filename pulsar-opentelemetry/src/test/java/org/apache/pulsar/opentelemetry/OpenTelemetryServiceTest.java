@@ -19,6 +19,7 @@
 package org.apache.pulsar.opentelemetry;
 
 import static io.opentelemetry.sdk.testing.assertj.OpenTelemetryAssertions.assertThat;
+import com.sun.management.GarbageCollectionNotificationInfo;
 import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
 import io.opentelemetry.api.metrics.LongCounterBuilder;
@@ -29,11 +30,17 @@ import io.opentelemetry.sdk.common.InstrumentationScopeInfo;
 import io.opentelemetry.sdk.metrics.export.MetricReader;
 import io.opentelemetry.sdk.testing.exporter.InMemoryMetricReader;
 import io.opentelemetry.semconv.ServiceAttributes;
+import java.lang.management.ManagementFactory;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
+import javax.management.NotificationEmitter;
+import javax.management.NotificationFilter;
+import javax.management.NotificationListener;
 import lombok.Cleanup;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.pulsar.broker.stats.prometheus.PrometheusMetricsClient;
@@ -154,6 +161,26 @@ public class OpenTelemetryServiceTest {
     }
 
     @Test
+    public void testPrometheusExporterDefaultsToAllInterfacesHost() {
+        // OpenTelemetry 1.62.0 changed the Prometheus exporter's default server host from "0.0.0.0" to "localhost".
+        // Pulsar restores the previous "0.0.0.0" default so the metrics endpoint stays reachable from outside the
+        // local host (e.g. another container or a remote Prometheus scraper). The default must remain overridable
+        // via the standard OTEL_EXPORTER_PROMETHEUS_HOST / otel.exporter.prometheus.host configuration.
+        var capturedHost = new AtomicReference<String>();
+        @Cleanup
+        var ots = OpenTelemetryService.builder()
+                .builderCustomizer(getBuilderCustomizer(null,
+                        Map.of(OpenTelemetryService.OTEL_SDK_DISABLED_KEY, "false"))
+                        .andThen(builder -> builder.addPropertiesCustomizer(config -> {
+                            capturedHost.set(config.getString(OpenTelemetryService.OTEL_EXPORTER_PROMETHEUS_HOST_KEY));
+                            return Map.of();
+                        })))
+                .clusterName("openTelemetryServicePrometheusHostTestCluster")
+                .build();
+        assertThat(capturedHost.get()).isEqualTo("0.0.0.0");
+    }
+
+    @Test
     public void testLongCounter() {
         var longCounter = meter.counterBuilder("dummyLongCounter").build();
         var attributes = Attributes.of(AttributeKey.stringKey("dummyAttr"), "dummyValue");
@@ -203,14 +230,34 @@ public class OpenTelemetryServiceTest {
     }
 
     @Test
-    public void testJvmRuntimeMetrics() {
-        // Force GC by creating memory pressure. Runtime.getRuntime().gc() is just a hint that the JVM
-        // can ignore, especially in a fresh JVM with plenty of heap. Allocating and discarding memory
-        // ensures at least one GC cycle occurs, so that jvm.gc.duration metric is populated.
-        for (int i = 0; i < 100; i++) {
-            byte[] waste = new byte[1024 * 1024]; // 1MB
+    public void testJvmRuntimeMetrics() throws Exception {
+        // jvm.gc.duration is recorded by the service's listener for the JVM's GC notifications, which the JVM
+        // delivers on its own thread after a collection ends, so it can be missing right after the GC returns.
+        // A GC MXBean calls its listeners one after another, in the order they were added, and this one is
+        // added after the service's, so once it has seen a notification the service has recorded that GC.
+        var gcNotified = new CountDownLatch(1);
+        NotificationListener gcListener = (notification, handback) -> gcNotified.countDown();
+        NotificationFilter gcFilter = notification ->
+                notification.getType().equals(GarbageCollectionNotificationInfo.GARBAGE_COLLECTION_NOTIFICATION);
+        var gcEmitters = ManagementFactory.getGarbageCollectorMXBeans().stream()
+                .filter(NotificationEmitter.class::isInstance)
+                .map(NotificationEmitter.class::cast)
+                .toList();
+        gcEmitters.forEach(emitter -> emitter.addNotificationListener(gcListener, gcFilter, null));
+        try {
+            // Force GC by creating memory pressure. Runtime.getRuntime().gc() is just a hint that the JVM
+            // can ignore, especially in a fresh JVM with plenty of heap. Allocating and discarding memory
+            // ensures at least one GC cycle occurs, so that jvm.gc.duration metric is populated.
+            for (int i = 0; i < 100; i++) {
+                byte[] waste = new byte[1024 * 1024]; // 1MB
+            }
+            Runtime.getRuntime().gc();
+            assertThat(gcNotified.await(30, TimeUnit.SECONDS)).as("GC notification delivered").isTrue();
+        } finally {
+            for (NotificationEmitter emitter : gcEmitters) {
+                emitter.removeNotificationListener(gcListener);
+            }
         }
-        Runtime.getRuntime().gc();
 
         var metrics = reader.collectAllMetrics();
 

@@ -18,7 +18,7 @@
  */
 package org.apache.pulsar.broker.service.persistent;
 
-import io.prometheus.client.Summary;
+import io.prometheus.metrics.core.metrics.Summary;
 import java.time.Clock;
 import java.util.Map;
 import java.util.Set;
@@ -47,6 +47,7 @@ public class ReplicatedSubscriptionsSnapshotBuilder {
 
     private final boolean needTwoRounds;
     private boolean firstRoundComplete;
+    private boolean finalSnapshotMarkerPending;
 
     private long startTimeMillis;
     private final long timeoutMillis;
@@ -55,8 +56,9 @@ public class ReplicatedSubscriptionsSnapshotBuilder {
 
     @PulsarDeprecatedMetric(newMetricName = OpenTelemetryReplicatedSubscriptionStats.SNAPSHOT_DURATION_METRIC_NAME)
     @Deprecated
-    public static final Summary SNAPSHOT_METRIC = Summary.build("pulsar_replicated_subscriptions_snapshot_ms",
-            "Time taken to create a consistent snapshot across clusters").register();
+    public static final Summary SNAPSHOT_METRIC = Summary.builder()
+            .name("pulsar_replicated_subscriptions_snapshot_ms")
+            .help("Time taken to create a consistent snapshot across clusters").register();
 
     public ReplicatedSubscriptionsSnapshotBuilder(ReplicatedSubscriptionsController controller,
                                                   Set<String> remoteClusters, ServiceConfiguration conf, Clock clock) {
@@ -115,15 +117,33 @@ public class ReplicatedSubscriptionsSnapshotBuilder {
             return;
         }
 
+        if (finalSnapshotMarkerPending) {
+            return;
+        }
+
+        finalSnapshotMarkerPending = true;
         log.debug()
                 .attr("snapshotId", snapshotId)
                 .log("Snapshot is complete");
         // Snapshot is now complete, store it in the local topic
         Position p = position;
-        controller.writeMarker(
+        controller.writeMarkerAndGetPosition(
                 Markers.newReplicatedSubscriptionsSnapshot(snapshotId, controller.localCluster(),
-                        p.getLedgerId(), p.getEntryId(), responses));
-        controller.snapshotCompleted(snapshotId);
+                        p.getLedgerId(), p.getEntryId(), responses))
+                .whenComplete((ignored, exception) -> {
+                    if (exception != null) {
+                        synchronized (ReplicatedSubscriptionsSnapshotBuilder.this) {
+                            finalSnapshotMarkerPending = false;
+                        }
+                        log.debug()
+                                .attr("snapshotId", snapshotId)
+                                .exception(exception)
+                                .log("Failed to publish completed snapshot marker");
+                        return;
+                    }
+
+                    controller.snapshotCompleted(snapshotId);
+                });
 
     }
 

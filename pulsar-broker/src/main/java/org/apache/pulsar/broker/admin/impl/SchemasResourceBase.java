@@ -21,6 +21,7 @@ package org.apache.pulsar.broker.admin.impl;
 import static java.util.Objects.isNull;
 import static org.apache.commons.lang3.StringUtils.defaultIfEmpty;
 import com.google.common.annotations.VisibleForTesting;
+import jakarta.ws.rs.core.Response;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -28,7 +29,6 @@ import java.time.Clock;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
-import javax.ws.rs.core.Response;
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.pulsar.broker.admin.AdminResource;
 import org.apache.pulsar.broker.service.schema.BookkeeperSchemaStorage;
@@ -48,6 +48,7 @@ import org.apache.pulsar.common.protocol.schema.SchemaData;
 import org.apache.pulsar.common.protocol.schema.SchemaVersion;
 import org.apache.pulsar.common.schema.LongSchemaVersion;
 import org.apache.pulsar.common.schema.SchemaType;
+import org.apache.pulsar.common.util.FutureUtil;
 
 public class SchemasResourceBase extends AdminResource {
 
@@ -150,7 +151,8 @@ public class SchemasResourceBase extends AdminResource {
 
     public CompletableFuture<Pair<Boolean, SchemaCompatibilityStrategy>> testCompatibilityAsync(
             PostSchemaPayload payload, boolean authoritative) {
-        return validateDestinationAndAdminOperationAsync(authoritative)
+        return validateTopicOwnershipAsync(topicName, authoritative)
+                .thenCompose(__ -> validateSchemaCompatibilityAccessAsync())
                 .thenCompose(__ -> getSchemaCompatibilityStrategyAsync())
                 .thenCompose(strategy -> {
                     String schemaId = getSchemaId();
@@ -235,6 +237,17 @@ public class SchemasResourceBase extends AdminResource {
     private CompletableFuture<Void> validateDestinationAndAdminOperationAsync(boolean authoritative) {
         return validateTopicOwnershipAsync(topicName, authoritative)
                 .thenCompose(__ -> validateAdminAccessForTenantAsync(topicName.getTenant()));
+    }
+
+    private CompletableFuture<Void> validateSchemaCompatibilityAccessAsync() {
+        return validateAdminAccessForTenantAsync(topicName.getTenant()).exceptionallyCompose(ex -> {
+            Throwable cause = FutureUtil.unwrapCompletionException(ex);
+            if (cause instanceof RestException rest
+                    && rest.getResponse().getStatus() == Response.Status.UNAUTHORIZED.getStatusCode()) {
+                return validateTopicOperationAsync(topicName, TopicOperation.GET_METADATA);
+            }
+            return CompletableFuture.failedFuture(cause);
+        });
     }
 
     private CompletableFuture<Void> validateOwnershipAndOperationAsync(boolean authoritative,

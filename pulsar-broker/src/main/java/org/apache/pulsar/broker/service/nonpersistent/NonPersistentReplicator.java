@@ -74,6 +74,11 @@ public class NonPersistentReplicator extends AbstractReplicator implements Repli
     }
 
     @Override
+    public void startProducer() {
+        super.startProducer();
+    }
+
+    @Override
     protected void setProducerAndTriggerReadEntries(Producer<byte[]> producer) {
         this.producer = (ProducerImpl) producer;
 
@@ -82,6 +87,8 @@ public class NonPersistentReplicator extends AbstractReplicator implements Repli
             backOff.reset();
         } else {
             log.info("Replicator was stopped while creating the producer, closing it");
+            // Do not keep the producer set above: the replicator was stopped.
+            this.producer = null;
             doCloseProducerAsync(producer, () -> {});
             return;
         }
@@ -89,6 +96,7 @@ public class NonPersistentReplicator extends AbstractReplicator implements Repli
 
     @SuppressWarnings("unchecked")
     public void sendMessage(Entry entry) {
+        latestPublishTime = System.currentTimeMillis();
         if ((STATE_UPDATER.get(this) == State.Started) && isWritable()) {
 
             int length = entry.getLength();

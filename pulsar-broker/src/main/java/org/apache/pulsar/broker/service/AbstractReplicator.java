@@ -86,6 +86,11 @@ public abstract class AbstractReplicator implements Replicator {
     private static final AtomicReferenceFieldUpdater<AbstractReplicator, Attributes> ATTRIBUTES_UPDATER =
             AtomicReferenceFieldUpdater.newUpdater(AbstractReplicator.class, Attributes.class, "attributes");
 
+    protected volatile long latestPublishTime = System.currentTimeMillis();
+
+    // The estimated time when the producer connection is successful, "0" means it will be connected immediately.
+    protected volatile long estimatedTimeStampProducerConnected = 0;
+
     public enum State {
         /**
          * This enum has two mean meanings：
@@ -184,7 +189,11 @@ public abstract class AbstractReplicator implements Replicator {
         return CompletableFuture.completedFuture(null);
     }
 
-    public void startProducer() {
+    protected void producerStartFailed(Throwable error, boolean preparingTopic) {
+        // Subclasses may retain startup diagnostics across attempts.
+    }
+
+    protected void startProducer() {
         // Guarantee only one task call "producerBuilder.createAsync()".
         Pair<Boolean, State> setStartingRes = compareSetAndGetState(State.Disconnected, State.Starting);
         if (!setStartingRes.getLeft()) {
@@ -207,17 +216,22 @@ public abstract class AbstractReplicator implements Replicator {
 
         // Force only replicate messages to a non-partitioned topic, to avoid auto-create a partitioned topic on
         // the remote cluster.
-        prepareCreateProducer().thenCompose(ignore -> {
+        // Capture synchronous preparation errors in the same retry path as asynchronous failures.
+        var preparation = FutureUtil.supplySafely(this::prepareCreateProducer);
+        preparation.thenCompose(ignore -> {
             ProducerBuilderImpl builderImpl = (ProducerBuilderImpl) producerBuilder;
             builderImpl.getConf().setNonPartitionedTopicExpected(true);
             builderImpl.getConf().setReplProducer(true);
             return producerBuilder.createAsync().thenAccept(producer -> {
+                estimatedTimeStampProducerConnected = 0;
                 setProducerAndTriggerReadEntries(producer);
             });
         }).exceptionally(ex -> {
+            producerStartFailed(ex, preparation.isCompletedExceptionally());
             Pair<Boolean, State> setDisconnectedRes = compareSetAndGetState(State.Starting, State.Disconnected);
             if (setDisconnectedRes.getLeft()) {
                 long waitTimeMs = backOff.next().toMillis();
+                estimatedTimeStampProducerConnected = System.currentTimeMillis() + waitTimeMs;
                 log.warn()
                         .exceptionMessage(ex)
                         .attr("waitTimeSec", waitTimeMs / 1000.0)
@@ -313,10 +327,8 @@ public abstract class AbstractReplicator implements Replicator {
     /**
      * This method only be used by {@link PersistentTopic#checkGC} now.
      */
-    @Override
-    public CompletableFuture<Void> disconnect() {
-        long backlog = getNumberOfEntriesInBacklog();
-        if (backlog > 0) {
+    protected CompletableFuture<Void> disconnect() {
+        if (hasBacklog()) {
             CompletableFuture<Void> disconnectFuture = new CompletableFuture<>();
             disconnectFuture.completeExceptionally(new TopicBusyException("Cannot close a replicator with backlog"));
             log.debug("Replicator disconnect failed since topic has backlog");
@@ -324,8 +336,7 @@ public abstract class AbstractReplicator implements Replicator {
         }
         log.info()
                 .attr("readPosition", getReplicatorReadPosition())
-                .attr("backlog", backlog)
-                .log("Disconnect replicator at position with backlog");
+                .log("Disconnect replicator at position without backlog");
         return beforeDisconnect()
             .thenCompose(__ -> closeProducerAsync(true))
             .thenApply(__ -> {
@@ -389,12 +400,10 @@ public abstract class AbstractReplicator implements Replicator {
             Pair<Boolean, State> setDisconnectedRes = compareSetAndGetState(State.Disconnecting, State.Disconnected);
             if (setDisconnectedRes.getLeft()) {
                 this.producer = null;
-                // deactivate further read
-                disableReplicatorRead();
                 return;
             }
             if (setDisconnectedRes.getRight() == State.Terminating
-                    || setDisconnectingRes.getRight() == State.Terminated) {
+                    || setDisconnectedRes.getRight() == State.Terminated) {
                 log.info("Skip setting state to terminated because it was already terminated");
             } else {
                 // Since only one task can call "doCloseProducerAsync(producer, action)", this scenario is not expected.
@@ -469,13 +478,47 @@ public abstract class AbstractReplicator implements Replicator {
         return producer != null && producer.isWritable();
     }
 
-    public static String getRemoteCluster(String remoteCursor) {
-        String[] split = remoteCursor.split("\\.");
-        return split[split.length - 1];
+    /**
+     * Extract the remote cluster name from a replicator cursor/subscription name, which is the inverse of
+     * {@link #getReplicatorName(String, String)}: the name is {@code <replicatorPrefix>.<remoteCluster>}.
+     *
+     * <p>The known prefix is stripped instead of splitting the name on {@code '.'} and taking the last
+     * segment: cluster names are allowed to contain dots (see
+     * {@link org.apache.pulsar.common.naming.NamedEntity#NAMED_ENTITY_PATTERN}), and splitting returns only
+     * the part after the last dot for those — so a cluster named {@code us-east.prod} resolved to
+     * {@code prod}.
+     *
+     * <p>This is also the authoritative test of whether a name belongs to a replicator: an empty result
+     * means the name is an ordinary subscription, so callers need no separate prefix check. The prefix must
+     * be followed by the {@code '.'} separator, so a subscription such as {@code pulsar.replication-state}
+     * is not mistaken for a replicator of the {@code pulsar.repl} prefix.
+     *
+     * @param replicatorPrefix      the configured replicator prefix (e.g. {@code pulsar.repl})
+     * @param replicatorCursorName  the replicator cursor / subscription name
+     * @return the remote cluster name, or empty when the name does not carry the prefix and separator
+     */
+    public static Optional<String> getRemoteCluster(String replicatorPrefix, String replicatorCursorName) {
+        String prefix = replicatorPrefix + ".";
+        return replicatorCursorName.startsWith(prefix)
+                ? Optional.of(replicatorCursorName.substring(prefix.length()))
+                : Optional.empty();
     }
 
     public static String getReplicatorName(String replicatorPrefix, String cluster) {
         return StringInterner.intern(replicatorPrefix + "." + cluster);
+    }
+
+    /**
+     * Returns whether a subscription/cursor name is a replicator cursor for the given prefix.
+     * <p>
+     * A replicator cursor is the configured prefix followed by a separator: {@code '.'} for a regular
+     * replicator ({@code <prefix>.<remoteCluster>}, see {@link #getReplicatorName(String, String)}) or
+     * {@code '-'} for a shadow replicator (see
+     * {@code ShadowReplicator#getShadowReplicatorName(String, String)}). Without the separator an ordinary
+     * subscription such as {@code pulsar.replication-state} is not a replicator cursor and must not be reserved.
+     */
+    public static boolean isReplicatorCursor(String replicatorPrefix, String name) {
+        return name.startsWith(replicatorPrefix + ".") || name.startsWith(replicatorPrefix + "-");
     }
 
     /**

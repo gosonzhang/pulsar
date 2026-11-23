@@ -18,13 +18,13 @@
  */
 package org.apache.pulsar.broker.service;
 
+import it.unimi.dsi.fastutil.longs.Long2IntMap;
+import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
+import it.unimi.dsi.fastutil.longs.Long2ObjectMap;
+import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
 import java.util.List;
 import java.util.concurrent.locks.StampedLock;
 import org.apache.bookkeeper.mledger.Position;
-import org.apache.pulsar.common.util.collections.Long2IntMap;
-import org.apache.pulsar.common.util.collections.Long2IntOpenHashMap;
-import org.apache.pulsar.common.util.collections.Long2ObjectMap;
-import org.apache.pulsar.common.util.collections.Long2ObjectOpenHashMap;
 
 public class InMemoryRedeliveryTracker implements RedeliveryTracker {
     // ledgerId -> entryId -> count
@@ -48,19 +48,13 @@ public class InMemoryRedeliveryTracker implements RedeliveryTracker {
 
     @Override
     public int getRedeliveryCount(long ledgerId, long entryId) {
-        long stamp = rwLock.tryOptimisticRead();
-        Long2IntMap entryMap = trackerCache.get(ledgerId);
-        int count = entryMap != null ? entryMap.get(entryId) : 0;
-        if (!rwLock.validate(stamp)) {
-            stamp = rwLock.readLock();
-            try {
-                entryMap = trackerCache.get(ledgerId);
-                count = entryMap != null ? entryMap.get(entryId) : 0;
-            } finally {
-                rwLock.unlockRead(stamp);
-            }
+        long stamp = rwLock.readLock();
+        try {
+            Long2IntMap entryMap = trackerCache.get(ledgerId);
+            return entryMap != null ? entryMap.get(entryId) : 0;
+        } finally {
+            rwLock.unlockRead(stamp);
         }
-        return count;
     }
 
     @Override

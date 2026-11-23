@@ -31,6 +31,7 @@ import org.apache.pulsar.broker.PulsarService;
 import org.apache.pulsar.broker.ServiceConfiguration;
 import org.apache.pulsar.broker.service.BrokerService;
 import org.apache.pulsar.broker.service.Consumer;
+import org.apache.pulsar.broker.service.GetStatsOptions;
 import org.apache.pulsar.broker.service.Topic;
 import org.apache.pulsar.broker.service.persistent.PersistentSubscription;
 import org.apache.pulsar.broker.service.persistent.PersistentTopic;
@@ -95,7 +96,8 @@ public class NamespaceStatsAggregatorTest {
         SubscriptionStatsImpl subStats = new SubscriptionStatsImpl();
         TopicStatsImpl topicStats = new TopicStatsImpl();
         topicStats.subscriptions.put("my-subscription", subStats);
-        when(topic.getStats(false, false, false)).thenReturn(topicStats);
+        GetStatsOptions statsOptions = GetStatsOptions.builder().excludeLastPublishTime(true).build();
+        when(topic.getStats(statsOptions)).thenReturn(topicStats);
         when(topic.getBrokerService()).thenReturn(broker);
         when(topic.getSubscriptions()).thenReturn(subscriptionsMaps);
         when(topic.getReplicators()).thenReturn(new ConcurrentHashMap<>());
@@ -108,7 +110,10 @@ public class NamespaceStatsAggregatorTest {
         PrometheusMetricStreams metricStreams = Mockito.spy(new PrometheusMetricStreams());
 
         // Populate subscriptions stats
+        ServiceConfiguration config = pulsar.getConfiguration();
+        doReturn(true).when(config).isExposeSubscriptionBacklogAgeInPrometheus();
         subStats.blockedSubscriptionOnUnackedMsgs = true;
+        subStats.oldestBacklogMessageAgeSeconds = 123;
         consumerStats.blockedConsumerOnUnackedMsgs = false; // should not affect blockedSubscriptionOnUnackedMsgs
         consumerStats.unackedMessages = 1;
         consumerStats.msgRateRedeliver = 0.7;
@@ -119,11 +124,13 @@ public class NamespaceStatsAggregatorTest {
                 true, true, metricStreams);
 
         // then
+        Mockito.verify(topic).getStats(statsOptions);
         verifySubscriptionMetric(metricStreams, "pulsar_subscription_blocked_on_unacked_messages", 1);
         verifyConsumerMetric(metricStreams, "pulsar_consumer_blocked_on_unacked_messages", 0);
 
         verifySubscriptionMetric(metricStreams, "pulsar_subscription_msg_rate_redeliver", 0.7);
         verifySubscriptionMetric(metricStreams, "pulsar_subscription_unacked_messages", 1L);
+        verifySubscriptionMetric(metricStreams, "pulsar_subscription_storage_backlog_age_seconds", 123L);
     }
 
     private void verifySubscriptionMetric(PrometheusMetricStreams metricStreams, String metricName, Number value) {

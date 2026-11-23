@@ -22,7 +22,9 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import lombok.CustomLog;
 import org.apache.pulsar.broker.PulsarService;
 import org.apache.pulsar.broker.ServiceConfiguration;
@@ -32,9 +34,12 @@ import org.apache.pulsar.common.policies.data.ClusterData;
 import org.apache.pulsar.common.policies.data.TenantInfo;
 import org.apache.pulsar.common.util.FutureUtil;
 import org.apache.pulsar.zookeeper.LocalBookkeeperEnsemble;
+import org.awaitility.Awaitility;
 import org.testng.Assert;
 import org.testng.annotations.AfterClass;
+import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeClass;
+import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
 
 @CustomLog
@@ -51,12 +56,11 @@ public class ExtensibleLoadManagerCloseTest {
         bk.start();
     }
 
-    private void setupBrokers(int numBrokers) throws Exception {
-        brokers.clear();
+    private void setupBrokers(int numBrokers, boolean topicPoliciesEnabled) throws Exception {
         for (int i = 0; i < numBrokers; i++) {
-            final var broker = new PulsarService(brokerConfig());
-            broker.start();
+            final var broker = new PulsarService(brokerConfig(topicPoliciesEnabled));
             brokers.add(broker);
+            broker.start();
         }
         final var admin = brokers.get(0).getAdminClient();
         if (!admin.clusters().getClusters().contains(clusterName)) {
@@ -68,12 +72,21 @@ public class ExtensibleLoadManagerCloseTest {
     }
 
 
+    @AfterMethod(alwaysRun = true, timeOut = 30000)
+    public void cleanupBrokers() throws Exception {
+        try {
+            FutureUtil.waitForAll(brokers.stream().map(PulsarService::closeAsync).toList()).get();
+        } finally {
+            brokers.clear();
+        }
+    }
+
     @AfterClass(alwaysRun = true, timeOut = 30000)
     public void cleanup() throws Exception {
         bk.stop();
     }
 
-    private ServiceConfiguration brokerConfig() {
+    private ServiceConfiguration brokerConfig(boolean topicPoliciesEnabled) {
         final var config = new ServiceConfiguration();
         config.setClusterName(clusterName);
         config.setAdvertisedAddress("localhost");
@@ -85,6 +98,7 @@ public class ExtensibleLoadManagerCloseTest {
         config.setManagedLedgerDefaultEnsembleSize(1);
         config.setDefaultNumberOfNamespaceBundles(16);
         config.setLoadBalancerAutoBundleSplitEnabled(false);
+        config.setTopicLevelPoliciesEnabled(topicPoliciesEnabled);
         config.setLoadManagerClassName(ExtensibleLoadManagerImpl.class.getName());
         config.setLoadBalancerDebugModeEnabled(true);
         config.setBrokerShutdownTimeoutMs(100);
@@ -96,9 +110,14 @@ public class ExtensibleLoadManagerCloseTest {
     }
 
 
-    @Test(invocationCount = 10)
-    public void testCloseAfterLoadingBundles() throws Exception {
-        setupBrokers(3);
+    @DataProvider
+    public Object[][] topicPoliciesEnabled() {
+        return new Object[][]{{false}, {true}};
+    }
+
+    @Test(invocationCount = 3, dataProvider = "topicPoliciesEnabled")
+    public void testCloseAfterLoadingBundles(boolean topicPoliciesEnabled) throws Exception {
+        setupBrokers(3, topicPoliciesEnabled);
         final var topic = "test-" + System.currentTimeMillis();
         final var admin = brokers.get(0).getAdminClient();
         admin.topics().createPartitionedTopic(topic, 20);
@@ -120,10 +139,10 @@ public class ExtensibleLoadManagerCloseTest {
         }
     }
 
-    @Test
-    public void testLookup() throws Exception {
-        setupBrokers(1);
-        final var topic = "test-lookup";
+    @Test(dataProvider = "topicPoliciesEnabled")
+    public void testLookup(boolean topicPoliciesEnabled) throws Exception {
+        setupBrokers(1, topicPoliciesEnabled);
+        final var topic = "test-lookup-" + UUID.randomUUID();
         final var numPartitions = 16;
         final var admin = brokers.get(0).getAdminClient();
         admin.topics().createPartitionedTopic(topic, numPartitions);
@@ -138,6 +157,47 @@ public class ExtensibleLoadManagerCloseTest {
         brokers.get(0).close();
         final var closeTimeMs = System.currentTimeMillis() - start;
         log.info().attr("closeTimeMs", closeTimeMs).log("Broker close time");
+        Assert.assertTrue(closeTimeMs < 5000L);
+    }
+
+    @Test(timeOut = 30000)
+    public void testCloseDoesNotWaitForRoleChange() throws Exception {
+        final var config = brokerConfig(false);
+        // The close waits for the load manager executor's tasks for half of it, then interrupts them
+        config.setBrokerShutdownTimeoutMs(10000);
+        final var broker = new PulsarService(config);
+        brokers.add(broker);
+        broker.start();
+        final var loadManager = ExtensibleLoadManagerImpl.get(broker);
+        // The role change of the start
+        Awaitility.await().until(() -> loadManager.getRole() == ExtensibleLoadManagerImpl.Role.Leader);
+
+        // A role change that runs while the broker is closing, once the close has disabled this broker, the only one,
+        // which closes its load manager
+        final var closing = new CountDownLatch(1);
+        broker.getLoadManagerExecutor().execute(() -> {
+            try {
+                closing.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        });
+        final var roleChangeInterrupted = new CompletableFuture<Boolean>();
+        broker.getLoadManagerExecutor().execute(() -> {
+            try {
+                loadManager.playLeader();
+            } finally {
+                roleChangeInterrupted.complete(Thread.currentThread().isInterrupted());
+            }
+        });
+
+        final var start = System.currentTimeMillis();
+        final var closeFuture = broker.closeAsync();
+        closing.countDown();
+        closeFuture.get();
+        final var closeTimeMs = System.currentTimeMillis() - start;
+        log.info().attr("closeTimeMs", closeTimeMs).log("Broker close time");
+        Assert.assertFalse(roleChangeInterrupted.get(), "the role change kept retrying until the close interrupted it");
         Assert.assertTrue(closeTimeMs < 5000L);
     }
 }

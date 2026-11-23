@@ -18,7 +18,9 @@
  */
 package org.apache.pulsar.broker.admin;
 
+import static org.apache.bookkeeper.mledger.ManagedCursor.CURSOR_INTERNAL_PROPERTY_PREFIX;
 import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertFalse;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -28,8 +30,8 @@ import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 import lombok.Cleanup;
 import org.apache.pulsar.broker.BrokerTestUtil;
-import org.apache.pulsar.broker.admin.AdminApiTest.MockedPulsarService;
 import org.apache.pulsar.broker.auth.MockedPulsarServiceBaseTest;
+import org.apache.pulsar.broker.service.persistent.PersistentTopic;
 import org.apache.pulsar.client.api.Consumer;
 import org.apache.pulsar.client.api.MessageId;
 import org.apache.pulsar.client.api.Producer;
@@ -41,25 +43,19 @@ import org.apache.pulsar.common.policies.data.TenantInfoImpl;
 import org.apache.pulsar.common.policies.data.TopicStats;
 import org.awaitility.Awaitility;
 import org.testng.Assert;
-import org.testng.annotations.AfterMethod;
-import org.testng.annotations.BeforeMethod;
+import org.testng.annotations.AfterClass;
+import org.testng.annotations.BeforeClass;
 import org.testng.annotations.Test;
 
 @Test(groups = "broker-admin")
 public class IncrementPartitionsTest extends MockedPulsarServiceBaseTest {
 
-    private MockedPulsarService mockPulsarSetup;
-
-    @BeforeMethod
+    // The test methods use topics of their own, so they share one broker
+    @BeforeClass
     @Override
     public void setup() throws Exception {
         conf.setLoadBalancerEnabled(true);
         super.internalSetup();
-
-        // create otherbroker to test redirect on calls that need
-        // namespace ownership
-        mockPulsarSetup = new MockedPulsarService(this.conf);
-        mockPulsarSetup.setup();
 
         // Setup namespaces
         admin.clusters().createCluster("test", ClusterData.builder().serviceUrl(pulsar.getWebServiceAddress()).build());
@@ -70,11 +66,10 @@ public class IncrementPartitionsTest extends MockedPulsarServiceBaseTest {
         setupDefaultTenantAndNamespace();
     }
 
-    @AfterMethod(alwaysRun = true)
+    @AfterClass(alwaysRun = true)
     @Override
     public void cleanup() throws Exception {
         super.internalCleanup();
-        mockPulsarSetup.cleanup();
     }
 
     @Test
@@ -147,6 +142,39 @@ public class IncrementPartitionsTest extends MockedPulsarServiceBaseTest {
         Map<String, String> subscriptionProperties = stats.getSubscriptions()
                 .get("sub-1").getSubscriptionProperties();
         Assert.assertEquals(properties, subscriptionProperties);
+    }
+
+    @Test
+    public void testIncrementPartitionsDoesNotCopyInternalCursorProperties() throws Exception {
+        String partitionedTopicName = UUID.randomUUID()
+                + "-testIncrementPartitionsDoesNotCopyInternalCursorProperties";
+        String subscriptionName = "sub-1";
+        Map<String, String> subscriptionProperties = Map.of("property", "value");
+
+        admin.topics().createPartitionedTopic(partitionedTopicName, 1);
+        @Cleanup
+        Consumer<byte[]> consumer = pulsarClient.newConsumer()
+                .topic(partitionedTopicName)
+                .subscriptionName(subscriptionName)
+                .subscriptionProperties(subscriptionProperties)
+                .subscribe();
+
+        String sourcePartition = TopicName.get(partitionedTopicName).getPartition(0).toString();
+        PersistentTopic sourceTopic = (PersistentTopic) pulsar.getBrokerService().getTopicReference(sourcePartition)
+                .orElseThrow();
+        String internalProperty = CURSOR_INTERNAL_PROPERTY_PREFIX + "test";
+        sourceTopic.getSubscription(subscriptionName).getCursor()
+                .putCursorProperty(internalProperty, "internal-value").get();
+
+        admin.topics().updatePartitionedTopic(partitionedTopicName, 2);
+
+        String newPartition = TopicName.get(partitionedTopicName).getPartition(1).toString();
+        PersistentTopic newTopic = (PersistentTopic) pulsar.getBrokerService().getTopicReference(newPartition)
+                .orElseThrow();
+        Map<String, String> newCursorProperties = newTopic.getSubscription(subscriptionName)
+                .getCursor().getCursorProperties();
+        assertEquals(newCursorProperties, subscriptionProperties);
+        assertFalse(newCursorProperties.containsKey(internalProperty));
     }
 
     @Test

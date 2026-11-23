@@ -17,6 +17,9 @@
  * under the License.
  */
 
+import org.gradle.api.artifacts.component.ModuleComponentIdentifier
+import org.gradle.api.artifacts.component.ProjectComponentIdentifier
+
 plugins {
     id("pulsar.java-conventions")
     id("pulsar.binary-license-check-conventions")
@@ -32,13 +35,17 @@ val zookeeperVersion: String = libs.versions.zookeeper.get()
 val nettyTcnativeVersion: String = libs.versions.netty.tcnative.get()
 val audienceAnnotationsVersion: String = libs.versions.audience.annotations.get()
 
-// Configuration for collecting runtime dependencies
-val distLib by configurations.creating {
-    isCanBeResolved = true
-    isCanBeConsumed = false
-    isTransitive = true
-    // Inherit version constraints from the root project's version catalog
-    extendsFrom(configurations["implementation"])
+// The runtime dependencies that the distribution bundles: declared in distLib, resolved with their
+// dependencies in distLibFiles (see ProjectArtifacts.kt)
+val distLibArtifacts = runtimeJars("distLibFiles", "distLib")
+val distLib = distLibArtifacts.dependencies
+val distLibFiles = distLibArtifacts.files
+distLibFiles.configure {
+    // Inherit the enforced version-alignment platform so bundled dependency versions match the
+    // version catalog (the platform lives on the non-published `internalPlatform` bucket from
+    // pulsar.java-conventions; `implementation` no longer carries it). Keeps the distribution's
+    // resolved versions aligned with what checkBinaryLicense expects.
+    extendsFrom(configurations["implementation"], configurations["internalPlatform"])
     // Global exclusions
     exclude(group = "org.projectlombok", module = "lombok")
     // Exclude test frameworks that leak through transitive deps
@@ -62,44 +69,37 @@ val distLib by configurations.creating {
     // Exclude non-JPMS JNA (we add jpms variants explicitly)
     exclude(group = "net.java.dev.jna", module = "jna")
     exclude(group = "net.java.dev.jna", module = "jna-platform")
-    // grpc modules not in server distribution (grpc-all transitively includes these)
-    exclude(group = "io.grpc", module = "grpc-netty")
-    exclude(group = "io.grpc", module = "grpc-okhttp")
-    exclude(group = "io.grpc", module = "grpc-testing")
     // Original zookeeper excluded — replaced by patched version
     exclude(group = "org.apache.zookeeper", module = "zookeeper")
     // Android annotations not in server dist
     exclude(group = "com.google.android", module = "annotations")
     // Annotation libraries not needed at runtime
     exclude(group = "org.codehaus.mojo", module = "animal-sniffer-annotations")
+    // The full fastutil jar (~25MB) is replaced by :pulsar-broker-fastutil-minimized below,
+    // which ships only the fastutil classes actually used on the server (and client) side.
+    exclude(group = "it.unimi.dsi", module = "fastutil")
 }
 
-// Resolvable configurations for cross-project artifact dependencies.
-// Using configurations instead of direct task references (project().tasks.named())
-// ensures compatibility with Gradle's configure-on-demand feature.
-val runtimeAllShadowJar by configurations.creating {
-    isCanBeResolved = true
-    isCanBeConsumed = false
-    isTransitive = false
-}
-val apiExamplesJar by configurations.creating {
-    isCanBeResolved = true
-    isCanBeConsumed = false
-    isTransitive = false
-}
+// The Java instance's fat jar (see SharedBuildArtifacts.kt) and the examples jar (see ProjectArtifacts.kt)
+val runtimeAllShadowJar = sharedBuildArtifact(":pulsar-functions:pulsar-functions-runtime-all", "java-instance-jar")
+val apiExamplesJar = projectJars("apiExamplesJar", ":pulsar-functions:pulsar-functions-api-examples").files
 
 dependencies {
     // Version constraints from the enforced platform (inherited via implementation,
     // which distLib extends) ensure consistent versions without manual resolutionStrategy.
     distLib(project(":pulsar-broker"))
+    // Minimized fastutil (replaces the full fastutil jar excluded from distLib above): only the
+    // fastutil classes reachable from the broker and the bundled pulsar-client-original.
+    distLib(project(":pulsar-broker-fastutil-minimized"))
     distLib(project(":pulsar-metadata"))
     distLib(project(":pulsar-docs-tools"))
     distLib(project(":pulsar-proxy"))
     distLib(project(":pulsar-broker-auth-oidc"))
     distLib(project(":pulsar-broker-auth-sasl"))
     distLib(project(":pulsar-client-auth-sasl"))
-    distLib(project(":jetty-upgrade:pulsar-bookkeeper-prometheus-metrics-provider"))
-    distLib(project(":jetty-upgrade:pulsar-zookeeper-prometheus-metrics"))
+    // Pulsar's own BookKeeper stats provider, built on the Prometheus Java client 1.x. It replaces
+    // org.apache.bookkeeper.stats:prometheus-metrics-provider, which is still on the legacy simpleclient.
+    distLib(project(":pulsar-bookkeeper-prometheus-metrics-provider"))
     distLib(project(":pulsar-package-management:pulsar-package-bookkeeper-storage")) {
         exclude(group = "org.objenesis")
     }
@@ -107,12 +107,9 @@ dependencies {
     distLib(project(":pulsar-client-tools"))
     distLib(project(":pulsar-testclient"))
     distLib(project(":pulsar-functions:pulsar-functions-worker")) {
-        exclude(group = "io.grpc")
         exclude(group = "org.bouncycastle")
     }
-    distLib(project(":pulsar-functions:pulsar-functions-local-runner-original")) {
-        exclude(group = "io.grpc")
-    }
+    distLib(project(":pulsar-functions:pulsar-functions-local-runner-original"))
 
     // Patched zookeeper (replaces the excluded original)
     distLib(project(":jetty-upgrade:zookeeper-with-patched-admin"))
@@ -123,6 +120,9 @@ dependencies {
     distLib(libs.log4j.web)
     distLib(libs.log4j.layout.template.json)
     distLib(libs.log4j.slf4j2.impl)
+    distLib(libs.log4j.jul)
+    // The async loggers that bin/pulsar enables need the LMAX Disruptor
+    distLib(libs.disruptor)
     distLib(libs.simpleclient.log4j2)
 
     // Metrics
@@ -133,12 +133,10 @@ dependencies {
     distLib(libs.dropwizardmetrics.jvm)
 
     // Other
-    distLib(libs.jline2)
     distLib(libs.snappy.java)
     distLib(libs.jackson.dataformat.yaml)
     distLib(libs.bcpkix.jdk18on)
     distLib(libs.perfmark.api)
-    distLib(libs.grpc.all)
 
     // JNA (JPMS variants used in Maven distribution)
     distLib("net.java.dev.jna:jna-jpms:${libs.versions.jna.get()}")
@@ -151,8 +149,9 @@ dependencies {
     distLib(libs.vertx.core)
     distLib(libs.vertx.web)
 
-    // Bouncy Castle
-    distLib(project(":bouncy-castle:bouncy-castle-bc"))
+    // Bouncy Castle (non-FIPS JCA provider for client-side message crypto + TLS)
+    distLib(libs.bcprov.jdk18on)
+    distLib(libs.bcpkix.jdk18on)
 
     // BookKeeper native JARs (these modules publish .nar artifacts by default;
     // we exclude .nar files below and add the .jar variants explicitly)
@@ -182,16 +181,12 @@ dependencies {
 
     // pulsar-broker-common test jar is included in Maven server dist
     // but requires test-fixtures support in pulsar-broker-common; skipped for now
-
-    // Cross-project artifact dependencies for the server distribution tarball
-    runtimeAllShadowJar(project(path = ":pulsar-functions:pulsar-functions-runtime-all", configuration = "shadowJarElements"))
-    apiExamplesJar(project(":pulsar-functions:pulsar-functions-api-examples"))
 }
 
 val pulsarVersion = project.version.toString()
-val rootDir = rootProject.projectDir
 
-val serverDistTar by tasks.registering(Tar::class) {
+val serverDistTar = tasks.register<Tar>("serverDistTar") {
+    description = "Builds the Pulsar server binary distribution tarball"
     archiveBaseName.set("apache-pulsar")
     archiveVersion.set(pulsarVersion)
     archiveClassifier.set("bin")
@@ -238,7 +233,7 @@ val serverDistTar by tasks.registering(Tar::class) {
 
     // Runtime dependency JARs into lib/
     // Include groupId in jar names to identify provenance (matches Maven assembly outputFileNameMapping)
-    from(distLib) {
+    from(distLibFiles) {
         into("${baseDir}/lib")
         // These JARs go into other directories (instances/, examples/), not lib/
         exclude("**/pulsar-functions-runtime-all-*.jar")
@@ -255,13 +250,13 @@ val serverDistTar by tasks.registering(Tar::class) {
     }
 
     // Build file-name -> groupId-prefixed-name map from resolved artifacts
-    val renameMap = distLib.incoming.artifacts.resolvedArtifacts.map { artifacts ->
+    val renameMap = distLibFiles.flatMap { it.incoming.artifacts.resolvedArtifacts }.map { artifacts ->
         artifacts.associate { result ->
             val id = result.id.componentIdentifier
             val file = result.file
             val ext = file.extension
             val newName = when (id) {
-                is org.gradle.api.artifacts.component.ModuleComponentIdentifier -> {
+                is ModuleComponentIdentifier -> {
                     // Include classifier from the file name if present
                     // e.g. netty-transport-native-epoll-x.y.z.Final-linux-x86_64.jar
                     val expectedBase = "${id.module}-${id.version}"
@@ -271,12 +266,8 @@ val serverDistTar by tasks.registering(Tar::class) {
                     } else ""
                     "${id.group}-${id.module}-${id.version}${classifier}.${ext}"
                 }
-                is org.gradle.api.artifacts.component.ProjectComponentIdentifier -> {
-                    var mappedName = file.nameWithoutExtension
-                    // For bouncy-castle-bc, add -pkg classifier
-                    if (mappedName.startsWith("bouncy-castle-bc-")) {
-                        mappedName = mappedName + "-pkg"
-                    }
+                is ProjectComponentIdentifier -> {
+                    val mappedName = file.nameWithoutExtension
                     "org.apache.pulsar-${mappedName}.${ext}"
                 }
                 else -> file.name
@@ -331,14 +322,8 @@ val serverDistTar by tasks.registering(Tar::class) {
     }
 }
 
-// Consumable configuration exposing the server distribution tarball
-val serverDistElements by configurations.creating {
-    isCanBeConsumed = true
-    isCanBeResolved = false
-    outgoing {
-        artifact(serverDistTar)
-    }
-}
+// The server distribution tarball, for the Docker image, see SharedBuildArtifacts.kt
+shareBuildArtifact("server-distribution", serverDistTar.flatMap { it.archiveFile }, serverDistTar)
 
 tasks.named("assemble") {
     dependsOn(serverDistTar)
@@ -350,13 +335,17 @@ binaryLicenseCheck {
 
 // Export the runtime classpath to a file for bin/ scripts to use
 // when running Pulsar from a development build (without lib/ directory)
-val exportClasspath by tasks.registering {
+val exportClasspath = tasks.register("exportClasspath") {
+    group = "build"
+    description = "Writes the distribution's runtime classpath to build/classpath.txt for the bin/ scripts"
     val outputFile = layout.buildDirectory.file("classpath.txt")
+    val classpath = files(distLibFiles)
+    inputs.files(classpath).withPropertyName("classpath").withNormalizer(ClasspathNormalizer::class.java)
     outputs.file(outputFile)
     doLast {
         outputFile.get().asFile.apply {
             parentFile.mkdirs()
-            writeText(distLib.asPath)
+            writeText(classpath.asPath)
         }
     }
 }

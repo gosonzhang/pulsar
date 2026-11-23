@@ -18,8 +18,16 @@
  */
 package org.apache.pulsar.broker.web;
 
-import static org.eclipse.jetty.ee8.nested.Request.getBaseRequest;
-import io.prometheus.client.CollectorRegistry;
+import com.google.common.annotations.VisibleForTesting;
+import io.prometheus.metrics.model.registry.PrometheusRegistry;
+import jakarta.servlet.DispatcherType;
+import jakarta.servlet.Filter;
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.FilterConfig;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.ServletRequest;
+import jakarta.servlet.ServletResponse;
+import jakarta.servlet.http.HttpServletResponse;
 import java.io.IOException;
 import java.net.URI;
 import java.util.ArrayList;
@@ -30,37 +38,32 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.TimeUnit;
-import javax.servlet.DispatcherType;
-import javax.servlet.Filter;
-import javax.servlet.FilterChain;
-import javax.servlet.FilterConfig;
-import javax.servlet.ServletException;
-import javax.servlet.ServletRequest;
-import javax.servlet.ServletResponse;
-import javax.servlet.http.HttpServletResponse;
 import lombok.CustomLog;
 import lombok.Getter;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.pulsar.broker.PulsarServerException;
 import org.apache.pulsar.broker.PulsarService;
 import org.apache.pulsar.broker.ServiceConfiguration;
+import org.apache.pulsar.broker.admin.v2.ScalableTopicPolicies;
+import org.apache.pulsar.broker.admin.v2.ScalableTopics;
 import org.apache.pulsar.broker.intercept.BrokerInterceptor;
 import org.apache.pulsar.broker.intercept.BrokerInterceptors;
+import org.apache.pulsar.broker.tls.DefaultBrokerTlsFactory;
+import org.apache.pulsar.broker.tls.TlsFactorySupport;
 import org.apache.pulsar.broker.validator.BindAddressValidator;
 import org.apache.pulsar.common.configuration.BindAddress;
-import org.apache.pulsar.common.util.PulsarSslConfiguration;
-import org.apache.pulsar.common.util.PulsarSslFactory;
 import org.apache.pulsar.jetty.metrics.JettyStatisticsCollector;
-import org.apache.pulsar.jetty.tls.JettySslContextFactory;
-import org.eclipse.jetty.ee8.nested.ContextHandler;
-import org.eclipse.jetty.ee8.nested.ResourceHandler;
-import org.eclipse.jetty.ee8.servlet.FilterHolder;
-import org.eclipse.jetty.ee8.servlet.ServletContextHandler;
-import org.eclipse.jetty.ee8.servlet.ServletHolder;
-import org.eclipse.jetty.ee8.websocket.server.JettyWebSocketServlet;
-import org.eclipse.jetty.ee8.websocket.server.config.JettyWebSocketServletContainerInitializer;
+import org.apache.pulsar.jetty.tls.JettyTlsFactory;
+import org.apache.pulsar.jetty.tls.PulsarSslConnectionFactory;
+import org.apache.pulsar.tls.PulsarTlsFactory;
+import org.apache.pulsar.tls.TlsFactoryInitContext;
+import org.apache.pulsar.tls.TlsPurpose;
+import org.eclipse.jetty.ee10.servlet.FilterHolder;
+import org.eclipse.jetty.ee10.servlet.ServletContextHandler;
+import org.eclipse.jetty.ee10.servlet.ServletContextRequest;
+import org.eclipse.jetty.ee10.servlet.ServletHolder;
+import org.eclipse.jetty.ee10.websocket.server.JettyWebSocketServlet;
+import org.eclipse.jetty.ee10.websocket.server.config.JettyWebSocketServletContainerInitializer;
 import org.eclipse.jetty.http.UriCompliance;
 import org.eclipse.jetty.server.ConnectionFactory;
 import org.eclipse.jetty.server.Connector;
@@ -74,15 +77,17 @@ import org.eclipse.jetty.server.RequestLog;
 import org.eclipse.jetty.server.SecureRequestCustomizer;
 import org.eclipse.jetty.server.Server;
 import org.eclipse.jetty.server.ServerConnector;
-import org.eclipse.jetty.server.SslConnectionFactory;
+import org.eclipse.jetty.server.handler.ContextHandler;
 import org.eclipse.jetty.server.handler.ContextHandlerCollection;
 import org.eclipse.jetty.server.handler.DefaultHandler;
 import org.eclipse.jetty.server.handler.QoSHandler;
+import org.eclipse.jetty.server.handler.ResourceHandler;
 import org.eclipse.jetty.server.handler.StatisticsHandler;
 import org.eclipse.jetty.util.resource.ResourceFactory;
 import org.eclipse.jetty.util.ssl.SslContextFactory;
 import org.glassfish.jersey.media.multipart.MultiPartFeature;
 import org.glassfish.jersey.server.ResourceConfig;
+import org.glassfish.jersey.server.ServerProperties;
 import org.glassfish.jersey.servlet.ServletContainer;
 
 /**
@@ -100,6 +105,7 @@ public class WebService implements AutoCloseable {
     private final PulsarService pulsar;
     private final Server server;
     private final List<Handler> handlers;
+    private final List<ResourceConfig> resourceConfigs = new ArrayList<>();
     @Deprecated
     private final WebExecutorStats executorStats;
     private final WebExecutorThreadPoolStats webExecutorThreadPoolStats;
@@ -109,8 +115,9 @@ public class WebService implements AutoCloseable {
     private final ServerConnector httpsConnector;
     private final FilterInitializer filterInitializer;
     private JettyStatisticsCollector jettyStatisticsCollector;
-    private PulsarSslFactory sslFactory;
-    private ScheduledFuture<?> sslContextRefreshTask;
+    // PIP-478 TLS SPI factory (the only server TLS path since PIP-337 removal).
+    private PulsarTlsFactory tlsFactory;
+    private JettyTlsFactory.ReloadableServerTls reloadableServerTls;
 
     @Getter
     private static final DynamicSkipUnknownPropertyHandler sharedUnknownPropertyHandler =
@@ -151,6 +158,7 @@ public class WebService implements AutoCloseable {
             httpConfig.addCustomizer(new ForwardedRequestCustomizer());
         }
         httpConfig.setRequestHeaderSize(pulsar.getConfig().getHttpMaxRequestHeaderSize());
+        httpConfig.setResponseHeaderSize(pulsar.getConfig().getHttpMaxResponseHeaderSize());
         httpConfig.setIdleTimeout(pulsar.getConfig().getHttpServerIdleTimeout());
         if (tlsRequired) {
             // org.eclipse.jetty.server.AbstractConnectionFactory.getFactories contains similar logic
@@ -163,21 +171,7 @@ public class WebService implements AutoCloseable {
         SslContextFactory.Server sslCtxFactory = null;
         if (tlsRequired) {
             try {
-                PulsarSslConfiguration sslConfiguration = buildSslConfiguration(config);
-                this.sslFactory = (PulsarSslFactory) Class.forName(config.getSslFactoryPlugin())
-                        .getConstructor().newInstance();
-                this.sslFactory.initialize(sslConfiguration);
-                this.sslFactory.createInternalSslContext();
-                if (config.getTlsCertRefreshCheckDurationSec() > 0) {
-                    this.sslContextRefreshTask = this.pulsar.getExecutor()
-                            .scheduleWithFixedDelay(this::refreshSslContext,
-                                    config.getTlsCertRefreshCheckDurationSec(),
-                                    config.getTlsCertRefreshCheckDurationSec(),
-                                    TimeUnit.SECONDS);
-                }
-                sslCtxFactory = JettySslContextFactory.createSslContextFactory(config.getWebServiceTlsProvider(),
-                        this.sslFactory, config.isTlsRequireTrustedClientCertOnConnect(),
-                        config.getTlsCiphers(), config.getTlsProtocols());
+                sslCtxFactory = createTlsFactoryWebServer(config);
             } catch (Exception e) {
                 throw new PulsarServerException(e);
             }
@@ -197,7 +191,8 @@ public class WebService implements AutoCloseable {
                 connectionFactories.add(new ProxyConnectionFactory());
             }
             if (isTls) {
-                connectionFactories.add(new SslConnectionFactory(sslCtxFactory, httpConnectionFactory.getProtocol()));
+                connectionFactories.add(
+                        new PulsarSslConnectionFactory(sslCtxFactory, httpConnectionFactory.getProtocol()));
             }
             connectionFactories.add(httpConnectionFactory);
             ServerConnector connector = new ServerConnector(server,
@@ -239,6 +234,11 @@ public class WebService implements AutoCloseable {
         for (String javaPackage : javaPackages) {
             config.packages(false, javaPackage);
         }
+        if (!pulsar.getConfiguration().isScalableTopicsEnabled()) {
+            config = new ResourceConfig(config.getClasses().stream()
+                    .filter(resource -> resource != ScalableTopics.class && resource != ScalableTopicPolicies.class)
+                    .toArray(Class<?>[]::new));
+        }
         addResourceServlet(basePath, requiresAuthentication, attributeMap, config, useSharedJsonMapperProvider);
     }
 
@@ -261,6 +261,14 @@ public class WebService implements AutoCloseable {
             config.register(JsonMapperProvider.class);
         }
         config.register(MultiPartFeature.class);
+        // Write the responses of async endpoints on the web service executor instead of the thread that resumes them
+        config.register(new WebExecutorAsyncResponseFeature(webServiceExecutor));
+        // Validating the resource model is about a third of Jersey's initialization of the context, at every broker
+        // start, while the model only changes with the code: WebServiceResourceModelTest validates it instead
+        config.property(ServerProperties.RESOURCE_VALIDATION_DISABLE, true);
+        // WADL needs a JAXB implementation, which the broker doesn't have: don't look for one
+        config.property(ServerProperties.WADL_FEATURE_DISABLE, true);
+        resourceConfigs.add(config);
         ServletHolder servletHolder = new ServletHolder(new ServletContainer(config));
         servletHolder.setAsyncSupported(true);
         addServlet(basePath, servletHolder, requiresAuthentication, attributeMap);
@@ -296,7 +304,7 @@ public class WebService implements AutoCloseable {
                 // hold all interceptors, instead we need to create a `ProcessHandlerFilter` for each `interceptor`.
                 if (pulsarService.getBrokerInterceptor() instanceof BrokerInterceptors) {
                     for (BrokerInterceptor interceptor: ((BrokerInterceptors) pulsarService.getBrokerInterceptor())
-                            .getInterceptors().values()) {
+                            .getInterceptors()) {
                         filterHolders.add(new FilterHolder(new ProcessHandlerFilter(interceptor)));
                     }
                 } else {
@@ -390,7 +398,8 @@ public class WebService implements AutoCloseable {
         @Override
         public void doFilter(ServletRequest request, ServletResponse response, FilterChain chain)
                 throws IOException, ServletException {
-            Connector connector = getBaseRequest(request).getHttpChannel().getConnector();
+            Connector connector = ServletContextRequest.getServletContextRequest(request)
+                    .getConnectionMetaData().getConnector();
             BindAddress bindAddress = connectorToBindAddress.get(connector);
             if (bindAddress != null) {
                 request.setAttribute(ATTRIBUTE_LISTENER_NAME, bindAddress.getListenerName());
@@ -410,12 +419,17 @@ public class WebService implements AutoCloseable {
         // Notice: each context path should be unique, but there's nothing here to verify that
         servletContextHandler.setContextPath(path);
         servletContextHandler.addServlet(servletHolder, MATCH_ALL);
+        // Jetty 12 ee10 rejects ambiguous URIs (e.g. %2F-encoded path separators) at the servlet layer by
+        // default, independent of the connector's UriCompliance. Pulsar admin paths embed encoded separators
+        // (e.g. topic names), so the servlet handler must be allowed to decode them (PIP-472 / Jetty 12).
+        servletContextHandler.getServletHandler().setDecodeAmbiguousURIs(true);
         if (attributeMap != null) {
             attributeMap.forEach(servletContextHandler::setAttribute);
         }
         filterInitializer.addFilters(servletContextHandler, requiresAuthentication);
 
-        handlers.add(servletContextHandler.get());
+        // The ee10 ServletContextHandler is itself an org.eclipse.jetty.server.Handler
+        handlers.add(servletContextHandler);
     }
 
     public void addWebSocketServlet(String path, JettyWebSocketServlet webSocketServlet,
@@ -425,7 +439,7 @@ public class WebService implements AutoCloseable {
         JettyWebSocketServletContainerInitializer.configure(servletContextHandler, null);
         ServletHolder servletHolder = new ServletHolder(webSocketServlet);
         servletContextHandler.addServlet(servletHolder, MATCH_ALL);
-        handlers.add(servletContextHandler.get());
+        handlers.add(servletContextHandler);
     }
 
     public void addStaticResources(String basePath, String resourcePath) {
@@ -437,7 +451,7 @@ public class WebService implements AutoCloseable {
         resHandler.setEtags(true);
         resHandler.setCacheControl(WebService.HANDLER_CACHE_CONTROL);
         capHandler.setHandler(resHandler);
-        handlers.add(capHandler.get());
+        handlers.add(capHandler);
     }
 
     public void start() throws PulsarServerException {
@@ -462,7 +476,7 @@ public class WebService implements AutoCloseable {
             stats.setHandler(handlerCollection);
             try {
                 jettyStatisticsCollector = new JettyStatisticsCollector(stats);
-                jettyStatisticsCollector.register();
+                PrometheusRegistry.defaultRegistry.register(jettyStatisticsCollector);
             } catch (IllegalArgumentException e) {
                 // Already registered. Eg: in unit tests
             }
@@ -528,11 +542,11 @@ public class WebService implements AutoCloseable {
 
     private void doClose() throws Exception {
         server.stop();
-        // unregister statistics from Prometheus client's default CollectorRegistry singleton
+        // unregister statistics from Prometheus client's default PrometheusRegistry singleton
         // to prevent memory leaks in tests
         if (jettyStatisticsCollector != null) {
             try {
-                CollectorRegistry.defaultRegistry.unregister(jettyStatisticsCollector);
+                PrometheusRegistry.defaultRegistry.unregister(jettyStatisticsCollector);
             } catch (Exception e) {
                 // ignore any exception happening in unregister
                 // exception will be thrown for 2. instance of WebService in tests since
@@ -541,12 +555,26 @@ public class WebService implements AutoCloseable {
             jettyStatisticsCollector = null;
         }
         webServiceExecutor.join();
-        if (this.sslContextRefreshTask != null) {
-            this.sslContextRefreshTask.cancel(true);
+        // PIP-478: dispose the TLS factory subscription and close the factory, if the new path was used.
+        if (this.reloadableServerTls != null) {
+            this.reloadableServerTls.subscription().dispose();
+            this.reloadableServerTls = null;
+        }
+        if (this.tlsFactory != null) {
+            this.tlsFactory.close();
+            this.tlsFactory = null;
         }
         webExecutorThreadPoolStats.close();
         this.executorStats.close();
         log.info("Web service closed");
+    }
+
+    /**
+     * The Jersey applications of the resources that {@link #addRestResources} and {@link #addRestResource} added.
+     */
+    @VisibleForTesting
+    List<ResourceConfig> getResourceConfigs() {
+        return resourceConfigs;
     }
 
     public Optional<Integer> getListenPortHTTP() {
@@ -565,33 +593,35 @@ public class WebService implements AutoCloseable {
         }
     }
 
-    protected PulsarSslConfiguration buildSslConfiguration(ServiceConfiguration serviceConfig) {
-        return PulsarSslConfiguration.builder()
-                .tlsKeyStoreType(serviceConfig.getTlsKeyStoreType())
-                .tlsKeyStorePath(serviceConfig.getTlsKeyStore())
-                .tlsKeyStorePassword(serviceConfig.getTlsKeyStorePassword())
-                .tlsTrustStoreType(serviceConfig.getTlsTrustStoreType())
-                .tlsTrustStorePath(serviceConfig.getTlsTrustStore())
-                .tlsTrustStorePassword(serviceConfig.getTlsTrustStorePassword())
-                .tlsCiphers(serviceConfig.getTlsCiphers())
-                .tlsProtocols(serviceConfig.getTlsProtocols())
-                .tlsTrustCertsFilePath(serviceConfig.getTlsTrustCertsFilePath())
-                .tlsCertificateFilePath(serviceConfig.getTlsCertificateFilePath())
-                .tlsKeyFilePath(serviceConfig.getTlsKeyFilePath())
-                .allowInsecureConnection(serviceConfig.isTlsAllowInsecureConnection())
-                .requireTrustedClientCertOnConnect(serviceConfig.isTlsRequireTrustedClientCertOnConnect())
-                .tlsEnabledWithKeystore(serviceConfig.isTlsEnabledWithKeyStore())
-                .tlsCustomParams(serviceConfig.getSslFactoryPluginParams())
-                .serverMode(true)
-                .isHttps(true)
-                .build();
-    }
-
-    protected void refreshSslContext() {
+    // PIP-478: build the PulsarTlsFactory and drive a vanilla Jetty SslContextFactory.Server through the
+    // SSLContext subscription (setSslContext pre-start, reload() on rotation). The web server has no cert
+    // refresh task — the factory delivers rotations to the reloading server factory.
+    private SslContextFactory.Server createTlsFactoryWebServer(ServiceConfiguration config) throws Exception {
+        this.tlsFactory = TlsFactorySupport.createFactory(config.getTlsFactoryClassName(),
+                DefaultBrokerTlsFactory.class, () -> DefaultBrokerTlsFactory.fromServiceConfiguration(config));
+        // Once the factory is created it owns live resources (cert watchers, HSM sessions, reload work).
+        // A failure in any subsequent step rethrows out of the constructor without returning a WebService,
+        // so doClose() is never reachable — dispose/close the partial state here to avoid leaking it.
         try {
-            this.sslFactory.update();
+            TlsFactoryInitContext initContext = TlsFactorySupport.initContext(
+                    TlsFactorySupport.parseFactoryConfig(config.getTlsFactoryConfig()),
+                    pulsar.getExecutor(), pulsar.getExecutor(), pulsar.getOpenTelemetry().getOpenTelemetry());
+            TlsFactorySupport.initializeBlocking(this.tlsFactory, initContext);
+            this.reloadableServerTls = JettyTlsFactory.createReloadingServerFactory(this.tlsFactory, TlsPurpose.WEB,
+                    pulsar.getExecutor(),
+                    config.getWebServiceTlsProvider(), config.resolveTlsClientAuthMode(),
+                    config.isTlsAllowInsecureConnection(), config.getTlsCiphers(), config.getTlsProtocols());
+            return this.reloadableServerTls.sslContextFactory();
         } catch (Exception e) {
-            log.error().exception(e).log("Failed to refresh SSL context");
+            if (this.reloadableServerTls != null) {
+                this.reloadableServerTls.subscription().dispose();
+                this.reloadableServerTls = null;
+            }
+            if (this.tlsFactory != null) {
+                this.tlsFactory.close();
+                this.tlsFactory = null;
+            }
+            throw e;
         }
     }
 }

@@ -27,6 +27,7 @@ import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertTrue;
 import com.google.common.collect.Sets;
 import java.lang.reflect.Field;
+import java.net.URI;
 import java.net.URL;
 import java.time.Duration;
 import java.util.Arrays;
@@ -44,6 +45,7 @@ import org.apache.bookkeeper.mledger.impl.ManagedCursorImpl;
 import org.apache.bookkeeper.mledger.impl.ManagedLedgerImpl;
 import org.apache.pulsar.broker.PulsarService;
 import org.apache.pulsar.broker.ServiceConfiguration;
+import org.apache.pulsar.broker.service.nonpersistent.NonPersistentTopic;
 import org.apache.pulsar.broker.service.persistent.GeoPersistentReplicator;
 import org.apache.pulsar.broker.service.persistent.PersistentReplicator;
 import org.apache.pulsar.broker.service.persistent.PersistentTopic;
@@ -55,6 +57,7 @@ import org.apache.pulsar.client.api.PulsarClient;
 import org.apache.pulsar.client.api.Schema;
 import org.apache.pulsar.client.impl.ProducerImpl;
 import org.apache.pulsar.common.naming.SystemTopicNames;
+import org.apache.pulsar.common.naming.TopicDomain;
 import org.apache.pulsar.common.naming.TopicName;
 import org.apache.pulsar.common.partition.PartitionedTopicMetadata;
 import org.apache.pulsar.common.policies.data.ClusterData;
@@ -126,16 +129,16 @@ public abstract class OneWayReplicatorTestBase extends TestRetrySupport {
         pulsar1 = new PulsarService(config1);
         pulsar1.start();
         broker1 = pulsar1.getBrokerService();
-        url1 = new URL(pulsar1.getWebServiceAddress());
-        urlTls1 = new URL(pulsar1.getWebServiceAddressTls());
+        url1 = URI.create(pulsar1.getWebServiceAddress()).toURL();
+        urlTls1 = URI.create(pulsar1.getWebServiceAddressTls()).toURL();
 
         // Start region 2
         setConfigDefaults(config2, cluster2, bkEnsemble2, brokerConfigZk2);
         pulsar2 = new PulsarService(config2);
         pulsar2.start();
         broker2 = pulsar2.getBrokerService();
-        url2 = new URL(pulsar2.getWebServiceAddress());
-        urlTls2 = new URL(pulsar2.getWebServiceAddressTls());
+        url2 = URI.create(pulsar2.getWebServiceAddress()).toURL();
+        urlTls2 = URI.create(pulsar2.getWebServiceAddressTls()).toURL();
     }
 
     protected void startAdminClient() throws Exception {
@@ -408,8 +411,13 @@ public abstract class OneWayReplicatorTestBase extends TestRetrySupport {
         Awaitility.await().untilAsserted(() -> {
             Optional<Topic> topicOptional2 = remoteCluster.getBrokerService().getTopic(topicName, false).get();
             assertTrue(topicOptional2.isPresent());
-            PersistentTopic persistentTopic2 = (PersistentTopic) topicOptional2.get();
-            assertFalse(persistentTopic2.getProducers().isEmpty());
+            if (TopicName.get(topicName).getDomain().equals(TopicDomain.persistent)) {
+                PersistentTopic persistentTopic2 = (PersistentTopic) topicOptional2.get();
+                assertFalse(persistentTopic2.getProducers().isEmpty());
+            } else {
+                NonPersistentTopic nonPersistentTopic2 = (NonPersistentTopic) topicOptional2.get();
+                assertFalse(nonPersistentTopic2.getProducers().isEmpty());
+            }
         });
     }
 

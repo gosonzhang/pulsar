@@ -20,11 +20,13 @@ package org.apache.pulsar.common.configuration;
 
 import static org.apache.pulsar.common.configuration.PulsarConfigurationLoader.isComplete;
 import static org.apache.pulsar.common.configuration.PulsarConfigurationLoader.runtimeConfigurationOverrides;
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertNotNull;
 import static org.testng.Assert.assertThrows;
 import static org.testng.Assert.assertTrue;
+import static org.testng.Assert.expectThrows;
 import com.google.common.collect.Sets;
 import java.io.File;
 import java.io.FileInputStream;
@@ -84,6 +86,69 @@ public class PulsarConfigurationLoaderTest {
     public void testConfigurationConverting_checkNonExistMember() {
         assertThrows(IllegalArgumentException.class,
                 () -> PulsarConfigurationLoader.convertFrom(new MockConfiguration(), false));
+    }
+
+    // PIP-478: a stale, removed PIP-337 sslFactoryPlugin key set to a non-default value is rejected loudly at
+    // config-file load with an actionable migration message, replacing the removed @Deprecated fail-loud field.
+    @Test
+    public void testRemovedPip337SslFactoryPluginKeysRejectedLoudly() {
+        for (String key : new String[] {"sslFactoryPlugin", "sslFactoryPluginParams",
+                "brokerClientSslFactoryPlugin", "brokerClientSslFactoryPluginParams",
+                // PIP-478 (FIX): broker.conf passes brokerClient_<clientKey> through to the internal client, so
+                // the prefixed form of the client removed keys must be rejected too (it would otherwise be
+                // silently dropped by ClientConfigurationData ignoreUnknown).
+                "brokerClient_sslFactoryPlugin", "brokerClient_sslFactoryPluginParams"}) {
+            Properties props = new Properties();
+            props.setProperty("clusterName", "test");
+            props.setProperty(key, "com.example.CustomSslFactory");
+            IllegalArgumentException ex = expectThrows(IllegalArgumentException.class,
+                    () -> PulsarConfigurationLoader.create(props, ServiceConfiguration.class));
+            assertTrue(ex.getMessage().contains(key), "message should name the removed key: " + ex.getMessage());
+            assertTrue(ex.getMessage().contains("tlsFactoryClassName"),
+                    "message should point to the successor: " + ex.getMessage());
+        }
+        // A blank value (the default) is tolerated -> loads cleanly.
+        Properties blank = new Properties();
+        blank.setProperty("clusterName", "test");
+        blank.setProperty("sslFactoryPlugin", "");
+        blank.setProperty("brokerClientSslFactoryPlugin", "");
+        assertNotNull(expectNoThrow(() -> PulsarConfigurationLoader.create(blank, ServiceConfiguration.class)));
+    }
+
+    // PIP-478 (FIX): a *Plugin key still naming the OLD DEFAULT factory FQCN is equivalent to "unset" (no
+    // custom factory), so it is tolerated — only a non-default (custom) value needs migration. The *PluginParams
+    // keys carry no default value, so any non-blank value is still rejected.
+    @Test
+    public void testRemovedPip337DefaultSslFactoryFqcnTolerated() {
+        String defaultFqcn = "org.apache.pulsar.common.util.DefaultPulsarSslFactory";
+        for (String key : new String[] {"sslFactoryPlugin", "brokerClientSslFactoryPlugin",
+                "brokerClient_sslFactoryPlugin"}) {
+            Properties props = new Properties();
+            props.setProperty("clusterName", "test");
+            props.setProperty(key, defaultFqcn);
+            assertNotNull(expectNoThrow(() -> PulsarConfigurationLoader.create(props, ServiceConfiguration.class)),
+                    "old default factory FQCN on '" + key + "' should be tolerated");
+        }
+        // A custom (non-default) value on the same key is still rejected.
+        Properties custom = new Properties();
+        custom.setProperty("clusterName", "test");
+        custom.setProperty("sslFactoryPlugin", "com.acme.CustomFactory");
+        expectThrows(IllegalArgumentException.class,
+                () -> PulsarConfigurationLoader.create(custom, ServiceConfiguration.class));
+        // The default FQCN is NOT a *PluginParams default -> a non-blank params value is still rejected.
+        Properties params = new Properties();
+        params.setProperty("clusterName", "test");
+        params.setProperty("sslFactoryPluginParams", defaultFqcn);
+        expectThrows(IllegalArgumentException.class,
+                () -> PulsarConfigurationLoader.create(params, ServiceConfiguration.class));
+    }
+
+    private static <T> T expectNoThrow(java.util.concurrent.Callable<T> callable) {
+        try {
+            return callable.call();
+        } catch (Exception e) {
+            throw new AssertionError("expected no exception but got: " + e, e);
+        }
     }
 
     // Deprecation warning suppressed as this test targets deprecated methods
@@ -157,6 +222,32 @@ public class PulsarConfigurationLoaderTest {
         prop.setProperty("metadataStoreUrl", zk);
         final ServiceConfiguration serviceConfig = PulsarConfigurationLoader.create(prop, ServiceConfiguration.class);
         assertThrows(IllegalArgumentException.class, () -> isComplete(serviceConfig));
+    }
+
+    @Test
+    public void testReplicationMaxReadProcessingStepsPerTurn() throws Exception {
+        Properties properties = new Properties();
+        properties.setProperty("clusterName", "test");
+        ServiceConfiguration defaults = PulsarConfigurationLoader.create(properties, ServiceConfiguration.class);
+        assertEquals(defaults.getReplicationMaxReadProcessingStepsPerTurn(), 64);
+        assertTrue(defaults.isManagedLedgerReadEntriesCallbackInline());
+        assertEquals(defaults.getManagedLedgerAddEntryHandoverMaxBatchItems(), 1024);
+        assertEquals(defaults.getManagedLedgerAddEntryHandoverMaxBatchBytesSize(), 5 * 1024 * 1024);
+        assertTrue(isComplete(defaults));
+
+        for (int limit : new int[] {1, 3, 64, 128, 0, -1}) {
+            properties.setProperty("replicationMaxReadProcessingStepsPerTurn", Integer.toString(limit));
+            ServiceConfiguration configuration =
+                    PulsarConfigurationLoader.create(properties, ServiceConfiguration.class);
+            assertEquals(configuration.getReplicationMaxReadProcessingStepsPerTurn(), limit);
+            if (limit > 0) {
+                assertTrue(isComplete(configuration));
+            } else {
+                IllegalArgumentException exception =
+                        expectThrows(IllegalArgumentException.class, () -> isComplete(configuration));
+                assertTrue(exception.getMessage().contains("replicationMaxReadProcessingStepsPerTurn"));
+            }
+        }
     }
 
     @Test
@@ -260,6 +351,10 @@ public class PulsarConfigurationLoaderTest {
         config.setNumIOThreads(config.getNumIOThreads());
         // Extra property not backed by a declared FieldContext field.
         config.getProperties().setProperty("custom.plugin.option", "enabled");
+        // Properties file entries that set declared fields to their default value (as broker.conf does for
+        // nearly every setting) must not be reported as overrides.
+        config.getProperties().setProperty("numIOThreads", String.valueOf(config.getNumIOThreads()));
+        config.getProperties().setProperty("metadataStoreUrl", config.getMetadataStoreUrl());
 
         Map<String, Object> overrides = runtimeConfigurationOverrides(config);
 
@@ -276,6 +371,66 @@ public class PulsarConfigurationLoaderTest {
         // Unchanged fields must not appear.
         assertFalse(overrides.containsKey("numIOThreads"));
         assertFalse(overrides.containsKey("metadataStoreUrl"));
+    }
+
+    @Test
+    public void testRuntimeConfigurationOverridesMasksSensitiveValues() {
+        ServiceConfiguration config = new ServiceConfiguration();
+        config.setClusterName("my-cluster");
+        config.setTlsKeyStorePassword("keystore-secret");
+        config.setBrokerClientTlsTrustStorePassword("truststore-secret");
+        config.setBrokerClientAuthenticationParameters("token:client-secret");
+        config.setBookkeeperClientAuthenticationParameters("bk-secret");
+        config.setManagedLedgerPassword("ml-secret");
+        config.setTlsFactoryConfig("{\"keyStorePassword\":\"factory-secret\"}");
+        Properties props = config.getProperties();
+        // Keys that are not declared fields are passed through to plugins and internal clients.
+        props.setProperty("tokenSecretKey", "data:;base64,token-secret");
+        props.setProperty("brokerClient_authParams", "client-param-secret");
+        props.setProperty("bookkeeper_tlsKeyStorePassword", "bk-tls-secret");
+        props.setProperty("s3ManagedLedgerOffloadCredentialSecret", "s3-secret");
+        props.setProperty("basicAuthConf", "data:;base64,basic-auth-secret");
+        props.setProperty("custom.plugin.option", "enabled");
+        // Blank undeclared keys are equivalent to unset.
+        props.setProperty("brokerClient_tlsTrustStorePassword", "");
+
+        Map<String, Object> overrides = runtimeConfigurationOverrides(config);
+
+        assertThat(overrides)
+                .containsEntry("clusterName", "my-cluster")
+                .containsEntry("custom.plugin.option", "enabled")
+                .containsEntry("tlsKeyStorePassword", PulsarConfigurationLoader.MASKED_VALUE)
+                .containsEntry("brokerClientTlsTrustStorePassword", PulsarConfigurationLoader.MASKED_VALUE)
+                .containsEntry("brokerClientAuthenticationParameters", PulsarConfigurationLoader.MASKED_VALUE)
+                .containsEntry("bookkeeperClientAuthenticationParameters", PulsarConfigurationLoader.MASKED_VALUE)
+                .containsEntry("managedLedgerPassword", PulsarConfigurationLoader.MASKED_VALUE)
+                .containsEntry("tlsFactoryConfig", PulsarConfigurationLoader.MASKED_VALUE)
+                .containsEntry("tokenSecretKey", PulsarConfigurationLoader.MASKED_VALUE)
+                .containsEntry("brokerClient_authParams", PulsarConfigurationLoader.MASKED_VALUE)
+                .containsEntry("bookkeeper_tlsKeyStorePassword", PulsarConfigurationLoader.MASKED_VALUE)
+                .containsEntry("s3ManagedLedgerOffloadCredentialSecret", PulsarConfigurationLoader.MASKED_VALUE)
+                .containsEntry("basicAuthConf", PulsarConfigurationLoader.MASKED_VALUE);
+        assertThat(overrides).doesNotContainKey("brokerClient_tlsTrustStorePassword");
+        assertThat(overrides.toString()).doesNotContain("secret");
+    }
+
+    @Test
+    public void testRuntimeConfigurationOverridesOfShippedConfigFiles() throws IOException {
+        for (String confFile : new String[]{"broker.conf", "standalone.conf"}) {
+            File file = new File("../conf/" + confFile);
+            if (!file.exists()) {
+                file = new File("conf/" + confFile);
+            }
+            ServiceConfiguration config = PulsarConfigurationLoader.create(file.getPath(),
+                    ServiceConfiguration.class);
+            Map<String, Object> overrides = runtimeConfigurationOverrides(config);
+            // The shipped files leave the sensitive keys (e.g. tokenSecretKey) and many plugin keys empty, which
+            // is equivalent to unset and must not be reported.
+            assertThat(overrides).as(confFile)
+                    .doesNotContainKeys("tokenSecretKey", "tokenPublicKey", "athenzDomainNames")
+                    .doesNotContainValue("")
+                    .doesNotContainValue(PulsarConfigurationLoader.MASKED_VALUE);
+        }
     }
 
     static class TestCompleteObject {

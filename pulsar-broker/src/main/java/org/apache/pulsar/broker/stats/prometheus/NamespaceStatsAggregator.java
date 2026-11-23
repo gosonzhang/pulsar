@@ -32,6 +32,7 @@ import org.apache.bookkeeper.mledger.impl.ManagedLedgerMBeanImpl;
 import org.apache.commons.collections4.MapUtils;
 import org.apache.commons.lang3.ArrayUtils;
 import org.apache.pulsar.broker.PulsarService;
+import org.apache.pulsar.broker.service.GetStatsOptions;
 import org.apache.pulsar.broker.service.Topic;
 import org.apache.pulsar.broker.service.persistent.PersistentTopic;
 import org.apache.pulsar.broker.service.persistent.PersistentTopicMetrics;
@@ -86,6 +87,8 @@ public class NamespaceStatsAggregator {
         Optional<CompactorMXBean> compactorMXBean = getCompactorMXBean(pulsar);
         LongAdder topicsCount = new LongAdder();
         Map<String, Long> localNamespaceTopicCount = new HashMap<>();
+        boolean exposeSubscriptionBacklogAge =
+                pulsar.getConfiguration().isExposeSubscriptionBacklogAgeInPrometheus();
         pulsar.getBrokerService().getMultiLayerTopicsMap().forEach((namespace, bundlesMap) -> {
             namespaceStats.reset();
             topicsCount.reset();
@@ -118,7 +121,7 @@ public class NamespaceStatsAggregator {
 
                     topicsCount.add(1);
                     TopicStats.printTopicStats(stream, topicStats, compactorMXBean, cluster, namespace, name,
-                        splitTopicAndPartitionIndexLabel, customLabelAndValues);
+                        splitTopicAndPartitionIndexLabel, exposeSubscriptionBacklogAge, customLabelAndValues);
                 } else {
                     namespaceStats.updateStats(topicStats);
                 }
@@ -152,11 +155,12 @@ public class NamespaceStatsAggregator {
         subsStats.bytesOutCounter = subscriptionStats.bytesOutCounter;
         subsStats.msgOutCounter = subscriptionStats.msgOutCounter;
         subsStats.msgBacklog = subscriptionStats.msgBacklog;
+        subsStats.backlogAgeSeconds = subscriptionStats.oldestBacklogMessageAgeSeconds;
         subsStats.msgDelayed = subscriptionStats.msgDelayed;
         subsStats.msgInReplay = subscriptionStats.msgInReplay;
         subsStats.msgRateExpired = subscriptionStats.msgRateExpired;
         subsStats.totalMsgExpired = subscriptionStats.totalMsgExpired;
-        subsStats.msgBacklogNoDelayed = subsStats.msgBacklog - subsStats.msgDelayed;
+        subsStats.msgBacklogNoDelayed = subscriptionStats.msgBacklogNoDelayed;
         subsStats.lastExpireTimestamp = subscriptionStats.lastExpireTimestamp;
         subsStats.lastAckedTimestamp = subscriptionStats.lastAckedTimestamp;
         subsStats.lastConsumedFlowTimestamp = subscriptionStats.lastConsumedFlowTimestamp;
@@ -239,7 +243,11 @@ public class NamespaceStatsAggregator {
                     backlogQuotaMetrics.getTimeBasedBacklogQuotaExceededEvictionCount();
         }
 
-        TopicStatsImpl tStatus = topic.getStats(getPreciseBacklog, subscriptionBacklogSize, false);
+        TopicStatsImpl tStatus = topic.getStats(GetStatsOptions.builder()
+                .getPreciseBacklog(getPreciseBacklog)
+                .subscriptionBacklogSize(subscriptionBacklogSize)
+                .excludeLastPublishTime(true)
+                .build());
         stats.msgInCounter = tStatus.msgInCounter;
         stats.bytesInCounter = tStatus.bytesInCounter;
         stats.msgOutCounter = tStatus.msgOutCounter;

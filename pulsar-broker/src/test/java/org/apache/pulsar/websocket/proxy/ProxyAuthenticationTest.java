@@ -24,16 +24,16 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doReturn;
 import com.google.common.collect.Sets;
+import jakarta.ws.rs.client.Client;
+import jakarta.ws.rs.client.ClientBuilder;
+import jakarta.ws.rs.client.Invocation;
+import jakarta.ws.rs.client.WebTarget;
+import jakarta.ws.rs.core.MediaType;
+import jakarta.ws.rs.core.Response;
 import java.net.URI;
 import java.util.Optional;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import javax.ws.rs.client.Client;
-import javax.ws.rs.client.ClientBuilder;
-import javax.ws.rs.client.Invocation;
-import javax.ws.rs.client.WebTarget;
-import javax.ws.rs.core.MediaType;
-import javax.ws.rs.core.Response;
 import lombok.Cleanup;
 import lombok.CustomLog;
 import org.apache.pulsar.client.api.ProducerConsumerBase;
@@ -102,13 +102,15 @@ public class ProxyAuthenticationTest extends ProducerConsumerBase {
             log.error().exception(e).log("Failed to stop proxy clients");
         }
 
-        super.internalCleanup();
+        // Stop the proxy before the broker: the broker would wait for the proxy's connections to close when it stops
+        // its web service
         if (service != null) {
             service.close();
         }
         if (proxyServer != null) {
             proxyServer.stop();
         }
+        super.internalCleanup();
         log.info("Finished Cleaning Up Test setup");
     }
 
